@@ -36,16 +36,33 @@ with col1:
 with col2:
     keyword = st.text_input("ファイル名に含む文字", "06")
 
-# --- 関数：PDFダウンロード ---
+# --- 関数：PDFダウンロード（修正版） ---
 def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
+    # 【修正1】ヘッダーを強化して、普通のブラウザからのアクセスに見せかける
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",  # 日本語環境であることを伝える
+        "Referer": "https://www.google.com/"             # Google検索から来たふりをする
     }
     
     status_text.text("サイトの情報を取得中...")
-    response = requests.get(target_url, headers=headers)
-    response.raise_for_status()
     
+    try:
+        # 【修正2】タイムアウト設定を追加（ずっと待機してエラーになるのを防ぐ）
+        response = requests.get(target_url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        # 具体的なエラーコード（403や404など）を表示する
+        st.error(f"サイトへのアクセスが拒否されました。ステータスコード: {e.response.status_code}")
+        st.write("考えられる原因: Streamlit Cloudのサーバー（海外IP）からのアクセスがブロックされている可能性があります。")
+        return []
+    except Exception as e:
+        st.error(f"接続エラーが発生しました: {e}")
+        return []
+    
+    # --- 以下は変更なし（文字化け対策を追加して安定させています） ---
+    response.encoding = response.apparent_encoding  # 文字化け防止
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a")
     
@@ -73,14 +90,15 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
     
     for i, (filename, url) in enumerate(download_targets):
         try:
-            file_res = requests.get(url, headers=headers)
+            # ダウンロード時も同じヘッダーを使う
+            file_res = requests.get(url, headers=headers, timeout=10)
             file_path = os.path.join(save_dir, filename)
             with open(file_path, "wb") as f:
                 f.write(file_res.content)
             downloaded_files.append(file_path)
             
             progress_bar.progress((i + 1) / len(download_targets))
-            time.sleep(0.1)
+            time.sleep(1) # 【修正3】アクセス間隔を少し長めに（1秒）してブロックを防ぐ
         except Exception as e:
             st.warning(f"{filename} の取得失敗: {e}")
             
