@@ -106,8 +106,8 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
 
 # --- 関数：AIによる抽出 ---
 def extract_data_with_ai(pdf_path, filename):
-    # Gemini 1.5 Flashモデルを使用（高速・安価）
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    # Gemini 2.5 Flashモデルを使用（高速・安価）
+    model = genai.GenerativeModel('gemini-2.5-flash')
     
     # PDFをアップロード
     sample_file = genai.upload_file(path=pdf_path, display_name=filename)
