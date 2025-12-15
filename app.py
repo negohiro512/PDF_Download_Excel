@@ -9,7 +9,7 @@ import json
 import pandas as pd
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-import datetime  # 【追加】日時記録用
+import datetime
 
 # --- 画面設定 ---
 st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
@@ -17,7 +17,7 @@ st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
 st.title("📄 PDF一括ダウンローダー & AI台帳作成")
 st.markdown("""
 指定URLからPDFを収集し、**前年度実績（報告書情報）**の数値を抽出してExcel化します。
-実行結果は画面下の「実行履歴」に保存されます。
+実行結果は画面下の「実行履歴」に保存され、**まとめて結合ダウンロード**も可能です。
 """)
 
 # --- セッションステート（履歴保存用）の初期化 ---
@@ -194,8 +194,7 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
 
 # --- データ変換関数（Excel用） ---
 def convert_df_to_excel(df):
-    output = pd.ExcelWriter('temp.xlsx', engine='openpyxl') # バイト列への書き込み準備
-    # バイトストリームを使うと複雑になるため、一時ファイルを作成して読み込む方式にします
+    # バイトストリームを使うと複雑になるため、一時ファイルを作成して読み込む方式
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         df.to_excel(tmp.name, index=False)
         with open(tmp.name, "rb") as f:
@@ -262,7 +261,7 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     df = df[target_cols]
                     df = df.rename(columns=column_mapping)
                     
-                    # 【追加】履歴に保存
+                    # 履歴に保存
                     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     history_item = {
                         "time": now,
@@ -270,20 +269,43 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                         "count": len(df),
                         "df": df
                     }
-                    st.session_state['history'].append(history_item) # リストに追加
+                    st.session_state['history'].append(history_item)
                     
-                    st.success(f"🎉 処理完了！ {len(df)} 件の実績データを抽出しました。下の「履歴」からいつでもダウンロードできます。")
+                    st.success(f"🎉 処理完了！ {len(df)} 件の実績データを抽出しました。")
                 else:
                     st.error("データの抽出に失敗しました。")
 
-# --- 実行履歴エリア（メイン処理の外に配置） ---
+# --- 実行履歴エリア ---
 st.markdown("---")
 st.subheader("📂 実行履歴")
 
 if len(st.session_state['history']) == 0:
     st.write("履歴はまだありません。")
 else:
-    # 新しい履歴が上に来るように逆順でループ
+    # ---------------------------------------------------------
+    # 【追加機能】履歴が複数ある場合、まとめてダウンロードするボタンを表示
+    # ---------------------------------------------------------
+    if len(st.session_state['history']) > 1:
+        st.info("💡 複数の抽出結果があります。これらを1つのファイルにまとめてダウンロードできます。")
+        
+        # 全てのDataFrameを結合 (pd.concat)
+        all_dfs = [item['df'] for item in st.session_state['history']]
+        merged_df = pd.concat(all_dfs, ignore_index=True)
+        
+        # 結合データのダウンロード
+        merged_excel = convert_df_to_excel(merged_df)
+        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        st.download_button(
+            label="📦 履歴をすべて結合してダウンロード (Merge All)",
+            data=merged_excel,
+            file_name=f"waste_report_merged_{now_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_all_btn"
+        )
+        st.markdown("---")
+
+    # 個別の履歴表示
     for i, item in enumerate(reversed(st.session_state['history'])):
         with st.expander(f"【{item['time']}】キーワード: {item['keyword']} (抽出数: {item['count']}件)"):
             st.dataframe(item['df'])
@@ -295,5 +317,6 @@ else:
                 data=excel_data,
                 file_name=f"waste_report_{item['time'].replace(':','-')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_btn_{i}" # ボタンIDが被らないようにする
+                key=f"dl_btn_{i}"
             )
+        
