@@ -27,7 +27,15 @@ if 'history' not in st.session_state:
 # --- サイドバー：設定 ---
 with st.sidebar:
     st.header("設定")
-    api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
+    
+    # 1. まずSecrets（安全な保管場所）からキーを探す
+    if "GEMINI_API_KEY" in st.secrets:
+        api_key = st.secrets["GEMINI_API_KEY"]
+        st.success("🔑 APIキーを自動で読み込みました")
+    # 2. なければ入力欄を表示する（ローカル環境や未設定時用）
+    else:
+        api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
+
     debug_mode = st.checkbox("デバッグモード（エラー詳細を表示）")
     
     # 履歴クリアボタン
@@ -38,7 +46,6 @@ with st.sidebar:
     if api_key:
         genai.configure(api_key=api_key)
     st.info("※APIキーがない場合、ダウンロードのみ実行されます。")
-
 # --- ユーザー入力欄 ---
 col1, col2 = st.columns([2, 1])
 with col1:
