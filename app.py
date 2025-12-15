@@ -16,13 +16,14 @@ st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
 st.title("📄 PDF一括ダウンローダー & AI台帳作成")
 st.markdown("""
 指定URLからPDFを収集し、**前年度実績（報告書情報）**の数値を抽出してExcel化します。
+※「計画値」は除外し、「実績値」のみを抽出します。
 """)
 
 # --- サイドバー：設定 ---
 with st.sidebar:
     st.header("設定")
     api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
-    debug_mode = st.checkbox("デバッグモード（エラー詳細を表示）") # 【追加】
+    debug_mode = st.checkbox("デバッグモード（エラー詳細を表示）")
     if api_key:
         genai.configure(api_key=api_key)
     st.info("※APIキーがない場合、ダウンロードのみ実行されます。")
@@ -91,26 +92,29 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
             
     return downloaded_files
 
-# --- 関数：AIによる抽出（修正版） ---
+# --- 関数：AIによる抽出（ご指定のモデル名を使用） ---
 def extract_data_with_ai(pdf_path, filename, debug_mode=False):
     # Gemini 2.5 Flash (Experimental) を優先
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
     except:
         model = genai.GenerativeModel('gemini-flash-latest')
-    
+
     try:
         sample_file = genai.upload_file(path=pdf_path, display_name=filename)
         while sample_file.state.name == "PROCESSING":
             time.sleep(1)
             sample_file = genai.get_file(sample_file.name)
+        
         if sample_file.state.name == "FAILED":
+            if debug_mode: st.error("ファイルのアップロード処理に失敗しました。")
             return []
+            
     except Exception as e:
         if debug_mode: st.error(f"アップロードエラー: {e}")
         return []
 
-    # プロンプト（指示書）：具体的キーワードで誘導する
+    # プロンプト（指示書）
     prompt = """
     あなたはデータ入力の専門家です。このPDF（産業廃棄物処理計画書・報告書）の「別紙」にある表から、数値を正確に転記してください。
 
@@ -122,8 +126,8 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
     【抽出項目定義】
     1. **提出日**: 表紙の右上にある日付（例：令和6年5月21日）。
     2. **対象年度**: 「①現状」や「実績」が指している年度。通常は提出日の前年度（例：令和5年度）。
-    3. **文書種類**: 全て「報告書」として出力。
-    4. **廃棄物の種類ごとの行作成**: 表にある全ての「産業廃棄物の種類」について、1種類につき1つのデータ（行）を作成してください。
+    3. **文書種類**: 全て「報告書」として出力してください。
+    4. **廃棄物の種類ごとの行作成**: 表にある全ての「産業廃棄物の種類」について、1種類につき1つのデータ（行）を作成してください。合計行は不要です。
 
     【出力フォーマット】
     以下のJSON形式のリスト（配列）のみを出力してください。Markdown記法（```json）は不要です。
@@ -147,26 +151,34 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
     """
     
     try:
-        response = model.generate_content(
-            [sample_file, prompt],
-            generation_config={"response_mime_type": "application/json"}
-        )
+        # 生成実行（モデル呼び出し時も、ご指定のロジックに従います）
+        try:
+            model = genai.GenerativeModel('gemini-2.5-flash')
+            response = model.generate_content(
+                [sample_file, prompt],
+                generation_config={"response_mime_type": "application/json"}
+            )
+        except Exception:
+            if debug_mode: st.warning("gemini-2.5-flash が利用できないため、gemini-flash-latest を使用します。")
+            model = genai.GenerativeModel('gemini-flash-latest')
+            response = model.generate_content(
+                [sample_file, prompt],
+                generation_config={"response_mime_type": "application/json"}
+            )
         
-        # デバッグモード時：生の回答を表示
         if debug_mode:
             st.text(f"--- {filename} のAI生回答 ---")
             st.text(response.text)
 
         data_list = json.loads(response.text)
         
-        # ファイル名を各データに追加
         for item in data_list:
             item['ファイル名'] = filename
             
         return data_list
     except Exception as e:
         if debug_mode:
-            st.error(f"JSON変換エラー: {e}")
+            st.error(f"データ解析エラー: {e}")
         return []
 
 # --- メイン処理 ---
@@ -197,7 +209,6 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     filename = os.path.basename(pdf_path)
                     status_text.text(f"分析中 ({i+1}/{len(downloaded_files)}): {filename}")
                     
-                    # デバッグモード設定を渡す
                     extracted_list = extract_data_with_ai(pdf_path, filename, debug_mode)
                     
                     if extracted_list:
@@ -209,10 +220,11 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                 if all_extracted_data:
                     df = pd.DataFrame(all_extracted_data)
                     
-                    # カラム順序とリネーム
+                    # 列の並び順指定（ファイル名 → 自治体名 → 提出日）
                     column_mapping = {
                         'ファイル名': 'ファイル名',
-                        '提出日': '提出日',
+                        '自治体名': '自治体名',        # 2番目に配置
+                        '提出日': '提出日',             # 3番目に配置
                         '対象年度': '対象年度',
                         '文書種類': '種類',
                         '排出事業者名': '排出事業者名',
@@ -222,7 +234,6 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                         '⑫再生利用業者への処理委託量_ton': '⑫再生利用(t)',
                         '⑬熱回収認定業者への処理委託量_ton': '⑬熱回収認定(t)',
                         '⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton': '⑭熱回収その他(t)',
-                        '自治体名': '自治体名',
                         '備考': '備考'
                     }
                     
@@ -238,10 +249,10 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     
                     with open(excel_path, "rb") as f:
                         st.download_button(
-                            label="📥 実績データのみのExcelをダウンロード",
+                            label="📥 実績データExcelをダウンロード",
                             data=f,
                             file_name="waste_report_results_only.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                 else:
-                    st.error("データの抽出に失敗しました。サイドバーの「デバッグモード」をオンにして再実行し、AIの回答を確認してください。")
+                    st.error("データの抽出に失敗しました。サイドバーの「デバッグモード」をONにして、詳細を確認してください。")
