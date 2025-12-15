@@ -28,16 +28,13 @@ if 'history' not in st.session_state:
 with st.sidebar:
     st.header("設定")
     
-    # 1. まずSecrets（安全な保管場所）からキーを探す
+    # SecretsからAPIキーを読み込む（なければ入力欄表示）
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("🔑 APIキーを自動で読み込みました")
-    # 2. なければ入力欄を表示する（ローカル環境や未設定時用）
     else:
         api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
 
-    debug_mode = st.checkbox("デバッグモード（エラー詳細を表示）")
-    
     # 履歴クリアボタン
     if st.button("🗑️ 履歴をクリア"):
         st.session_state['history'] = []
@@ -46,6 +43,7 @@ with st.sidebar:
     if api_key:
         genai.configure(api_key=api_key)
     st.info("※APIキーがない場合、ダウンロードのみ実行されます。")
+
 # --- ユーザー入力欄 ---
 col1, col2 = st.columns([2, 1])
 with col1:
@@ -110,8 +108,8 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
             
     return downloaded_files
 
-# --- 関数：AIによる抽出（ご指定のモデル名を使用） ---
-def extract_data_with_ai(pdf_path, filename, debug_mode=False):
+# --- 関数：AIによる抽出（エラー自動表示版） ---
+def extract_data_with_ai(pdf_path, filename):
     # Gemini 2.5 Flash (Experimental) を優先
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
@@ -125,11 +123,11 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
             sample_file = genai.get_file(sample_file.name)
         
         if sample_file.state.name == "FAILED":
-            if debug_mode: st.error("ファイルのアップロード処理に失敗しました。")
+            st.error(f"【{filename}】ファイルのアップロード処理に失敗しました。")
             return []
             
     except Exception as e:
-        if debug_mode: st.error(f"アップロードエラー: {e}")
+        st.error(f"【{filename}】アップロードエラー: {e}")
         return []
 
     # プロンプト（指示書）
@@ -177,31 +175,34 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
                 generation_config={"response_mime_type": "application/json"}
             )
         except Exception:
-            if debug_mode: st.warning("gemini-2.5-flash が利用できないため、gemini-flash-latest を使用します。")
+            # モデルエラー時は警告を出すだけにして、代替モデルで再試行
+            # st.warning("gemini-2.5-flash が利用できないため、gemini-flash-latest を使用します。") 
             model = genai.GenerativeModel('gemini-flash-latest')
             response = model.generate_content(
                 [sample_file, prompt],
                 generation_config={"response_mime_type": "application/json"}
             )
         
-        if debug_mode:
-            st.text(f"--- {filename} のAI生回答 ---")
-            st.text(response.text)
-
+        # JSON変換を試みる
         data_list = json.loads(response.text)
         
         for item in data_list:
             item['ファイル名'] = filename
             
         return data_list
+
     except Exception as e:
-        if debug_mode:
-            st.error(f"データ解析エラー: {e}")
+        # 【重要】エラー発生時のみ、エラー詳細とAIの生回答を表示する
+        st.error(f"❌ 【{filename}】解析エラー: {e}")
+        
+        # response変数が存在する場合（JSON変換手前で失敗した場合など）は、中身を表示して原因特定を助ける
+        if 'response' in locals():
+            with st.expander("⚠️ AIの生回答（エラー原因の確認用）"):
+                st.text(response.text)
         return []
 
 # --- データ変換関数（Excel用） ---
 def convert_df_to_excel(df):
-    # バイトストリームを使うと複雑になるため、一時ファイルを作成して読み込む方式
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         df.to_excel(tmp.name, index=False)
         with open(tmp.name, "rb") as f:
@@ -236,7 +237,8 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     filename = os.path.basename(pdf_path)
                     status_text.text(f"分析中 ({i+1}/{len(downloaded_files)}): {filename}")
                     
-                    extracted_list = extract_data_with_ai(pdf_path, filename, debug_mode)
+                    # デバッグモード引数は不要になったので削除
+                    extracted_list = extract_data_with_ai(pdf_path, filename)
                     
                     if extracted_list:
                         all_extracted_data.extend(extracted_list)
@@ -247,7 +249,6 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                 if all_extracted_data:
                     df = pd.DataFrame(all_extracted_data)
                     
-                    # 列の並び順指定
                     column_mapping = {
                         'ファイル名': 'ファイル名',
                         '自治体名': '自治体名',
@@ -280,7 +281,7 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     
                     st.success(f"🎉 処理完了！ {len(df)} 件の実績データを抽出しました。")
                 else:
-                    st.error("データの抽出に失敗しました。")
+                    st.error("データの抽出に失敗しました。上のエラーメッセージを確認してください。")
 
 # --- 実行履歴エリア ---
 st.markdown("---")
@@ -289,17 +290,12 @@ st.subheader("📂 実行履歴")
 if len(st.session_state['history']) == 0:
     st.write("履歴はまだありません。")
 else:
-    # ---------------------------------------------------------
-    # 【追加機能】履歴が複数ある場合、まとめてダウンロードするボタンを表示
-    # ---------------------------------------------------------
     if len(st.session_state['history']) > 1:
         st.info("💡 複数の抽出結果があります。これらを1つのファイルにまとめてダウンロードできます。")
         
-        # 全てのDataFrameを結合 (pd.concat)
         all_dfs = [item['df'] for item in st.session_state['history']]
         merged_df = pd.concat(all_dfs, ignore_index=True)
         
-        # 結合データのダウンロード
         merged_excel = convert_df_to_excel(merged_df)
         now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -312,12 +308,10 @@ else:
         )
         st.markdown("---")
 
-    # 個別の履歴表示
     for i, item in enumerate(reversed(st.session_state['history'])):
         with st.expander(f"【{item['time']}】キーワード: {item['keyword']} (抽出数: {item['count']}件)"):
             st.dataframe(item['df'])
             
-            # Excelダウンロードボタン
             excel_data = convert_df_to_excel(item['df'])
             st.download_button(
                 label=f"📥 このExcelをダウンロード",
@@ -326,4 +320,3 @@ else:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key=f"dl_btn_{i}"
             )
-        
