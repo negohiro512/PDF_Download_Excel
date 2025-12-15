@@ -95,9 +95,9 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
 def extract_data_with_ai(pdf_path, filename, debug_mode=False):
     # Gemini 2.5 Flash (Experimental) を優先
     try:
-        model = genai.GenerativeModel('gemini-2.5-flash-exp')
-    except:
         model = genai.GenerativeModel('gemini-2.5-flash')
+    except:
+        model = genai.GenerativeModel('gemini-flash-latest')
     
     try:
         sample_file = genai.upload_file(path=pdf_path, display_name=filename)
