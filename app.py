@@ -9,6 +9,7 @@ import json
 import pandas as pd
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+import datetime  # 【追加】日時記録用
 
 # --- 画面設定 ---
 st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
@@ -16,14 +17,24 @@ st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
 st.title("📄 PDF一括ダウンローダー & AI台帳作成")
 st.markdown("""
 指定URLからPDFを収集し、**前年度実績（報告書情報）**の数値を抽出してExcel化します。
-※「計画値」は除外し、「実績値」のみを抽出します。
+実行結果は画面下の「実行履歴」に保存されます。
 """)
+
+# --- セッションステート（履歴保存用）の初期化 ---
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
 
 # --- サイドバー：設定 ---
 with st.sidebar:
     st.header("設定")
     api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
     debug_mode = st.checkbox("デバッグモード（エラー詳細を表示）")
+    
+    # 履歴クリアボタン
+    if st.button("🗑️ 履歴をクリア"):
+        st.session_state['history'] = []
+        st.rerun()
+
     if api_key:
         genai.configure(api_key=api_key)
     st.info("※APIキーがない場合、ダウンロードのみ実行されます。")
@@ -151,7 +162,7 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
     """
     
     try:
-        # 生成実行（モデル呼び出し時も、ご指定のロジックに従います）
+        # 生成実行
         try:
             model = genai.GenerativeModel('gemini-2.5-flash')
             response = model.generate_content(
@@ -180,6 +191,16 @@ def extract_data_with_ai(pdf_path, filename, debug_mode=False):
         if debug_mode:
             st.error(f"データ解析エラー: {e}")
         return []
+
+# --- データ変換関数（Excel用） ---
+def convert_df_to_excel(df):
+    output = pd.ExcelWriter('temp.xlsx', engine='openpyxl') # バイト列への書き込み準備
+    # バイトストリームを使うと複雑になるため、一時ファイルを作成して読み込む方式にします
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        df.to_excel(tmp.name, index=False)
+        with open(tmp.name, "rb") as f:
+            data = f.read()
+    return data
 
 # --- メイン処理 ---
 if st.button("🚀 ダウンロード & データ抽出を開始"):
@@ -216,15 +237,15 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     
                     progress_bar.progress((i + 1) / len(downloaded_files))
                 
-                # 3. データ整形とExcel化
+                # 3. データ整形と保存
                 if all_extracted_data:
                     df = pd.DataFrame(all_extracted_data)
                     
-                    # 列の並び順指定（ファイル名 → 自治体名 → 提出日）
+                    # 列の並び順指定
                     column_mapping = {
                         'ファイル名': 'ファイル名',
-                        '自治体名': '自治体名',        # 2番目に配置
-                        '提出日': '提出日',             # 3番目に配置
+                        '自治体名': '自治体名',
+                        '提出日': '提出日',
                         '対象年度': '対象年度',
                         '文書種類': '種類',
                         '排出事業者名': '排出事業者名',
@@ -240,19 +261,39 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     target_cols = [c for c in column_mapping.keys() if c in df.columns]
                     df = df[target_cols]
                     df = df.rename(columns=column_mapping)
-
-                    st.success(f"🎉 処理完了！ {len(df)} 件の実績データを抽出しました。")
-                    st.dataframe(df)
                     
-                    excel_path = os.path.join(temp_dir, "waste_report_results_only.xlsx")
-                    df.to_excel(excel_path, index=False)
+                    # 【追加】履歴に保存
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    history_item = {
+                        "time": now,
+                        "keyword": keyword,
+                        "count": len(df),
+                        "df": df
+                    }
+                    st.session_state['history'].append(history_item) # リストに追加
                     
-                    with open(excel_path, "rb") as f:
-                        st.download_button(
-                            label="📥 実績データExcelをダウンロード",
-                            data=f,
-                            file_name="waste_report_results_only.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                    st.success(f"🎉 処理完了！ {len(df)} 件の実績データを抽出しました。下の「履歴」からいつでもダウンロードできます。")
                 else:
-                    st.error("データの抽出に失敗しました。サイドバーの「デバッグモード」をONにして、詳細を確認してください。")
+                    st.error("データの抽出に失敗しました。")
+
+# --- 実行履歴エリア（メイン処理の外に配置） ---
+st.markdown("---")
+st.subheader("📂 実行履歴")
+
+if len(st.session_state['history']) == 0:
+    st.write("履歴はまだありません。")
+else:
+    # 新しい履歴が上に来るように逆順でループ
+    for i, item in enumerate(reversed(st.session_state['history'])):
+        with st.expander(f"【{item['time']}】キーワード: {item['keyword']} (抽出数: {item['count']}件)"):
+            st.dataframe(item['df'])
+            
+            # Excelダウンロードボタン
+            excel_data = convert_df_to_excel(item['df'])
+            st.download_button(
+                label=f"📥 このExcelをダウンロード",
+                data=excel_data,
+                file_name=f"waste_report_{item['time'].replace(':','-')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"dl_btn_{i}" # ボタンIDが被らないようにする
+            )
