@@ -15,14 +15,14 @@ st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
 
 st.title("📄 PDF一括ダウンローダー & AI台帳作成")
 st.markdown("""
-指定URLからPDFを収集し、**前年度実績（報告書情報）のみ**を抽出してExcel化します。
-計画値（目標）は除外されます。
+指定URLからPDFを収集し、**前年度実績（報告書情報）**の数値を抽出してExcel化します。
 """)
 
 # --- サイドバー：設定 ---
 with st.sidebar:
     st.header("設定")
     api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
+    debug_mode = st.checkbox("デバッグモード（エラー詳細を表示）") # 【追加】
     if api_key:
         genai.configure(api_key=api_key)
     st.info("※APIキーがない場合、ダウンロードのみ実行されます。")
@@ -91,8 +91,8 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
             
     return downloaded_files
 
-# --- 関数：AIによる抽出（実績のみに限定） ---
-def extract_data_with_ai(pdf_path, filename):
+# --- 関数：AIによる抽出（修正版） ---
+def extract_data_with_ai(pdf_path, filename, debug_mode=False):
     # Gemini 2.5 Flash (Experimental) を優先
     try:
         model = genai.GenerativeModel('gemini-2.5-flash-exp')
@@ -107,22 +107,26 @@ def extract_data_with_ai(pdf_path, filename):
         if sample_file.state.name == "FAILED":
             return []
     except Exception as e:
-        st.error(f"アップロードエラー: {e}")
+        if debug_mode: st.error(f"アップロードエラー: {e}")
         return []
 
-    # プロンプト（指示書）：実績のみに限定
+    # プロンプト（指示書）：具体的キーワードで誘導する
     prompt = """
-    このPDFは産業廃棄物の処理計画書・報告書です。
-    PDF内の表（特に別紙の内訳表）から、**「前年度実績（現状）」**のデータのみを抽出してください。
-    
-    【重要：抽出ルール】
-    1. **実績のみ抽出**: 「計画」や「目標」の数値は**全て無視**してください。抽出対象は「実績」や「現状」と書かれた欄の数値のみです。
-    2. **対象年度**: 実績値の対象となっている年度（例：提出日が令和6年5月なら、対象年度は「令和5年度」）を抽出してください。
-    3. **種類ごとの分割**: 合計行ではなく、廃棄物の種類ごとに1行ずつデータを作成してください。
-    4. **文書種類**: 全て「報告書」として出力してください（実績値を扱うため）。
-    5. **提出日**: 表紙の提出日を正確に抽出してください。
+    あなたはデータ入力の専門家です。このPDF（産業廃棄物処理計画書・報告書）の「別紙」にある表から、数値を正確に転記してください。
 
-    以下のJSON形式のリスト（配列）で出力してください。該当する実績データがない場合は空リスト [] を返してください。
+    【最重要ルール】
+    表には「①現状（前年度実績）」と「②計画（目標）」の2つの列が並んでいる場合があります。
+    **必ず「①現状」または「【前年度実績】」と書かれている列の数値のみ**を抽出してください。
+    「②計画」や「【目標】」の列の数値は絶対に抽出しないでください。
+
+    【抽出項目定義】
+    1. **提出日**: 表紙の右上にある日付（例：令和6年5月21日）。
+    2. **対象年度**: 「①現状」や「実績」が指している年度。通常は提出日の前年度（例：令和5年度）。
+    3. **文書種類**: 全て「報告書」として出力。
+    4. **廃棄物の種類ごとの行作成**: 表にある全ての「産業廃棄物の種類」について、1種類につき1つのデータ（行）を作成してください。
+
+    【出力フォーマット】
+    以下のJSON形式のリスト（配列）のみを出力してください。Markdown記法（```json）は不要です。
     
     [
       {
@@ -131,9 +135,9 @@ def extract_data_with_ai(pdf_path, filename):
         "文書種類": "報告書",
         "排出事業者名": "株式会社〇〇",
         "廃棄物の種類": "がれき類",
-        "⑩全処理委託量_ton": 100.5,
+        "⑩全処理委託量_ton": 1299.99,
         "⑪優良認定処理業者への処理委託量_ton": 0,
-        "⑫再生利用業者への処理委託量_ton": 100.5,
+        "⑫再生利用業者への処理委託量_ton": 1299.99,
         "⑬熱回収認定業者への処理委託量_ton": 0,
         "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
         "自治体名": "福岡市",
@@ -147,6 +151,12 @@ def extract_data_with_ai(pdf_path, filename):
             [sample_file, prompt],
             generation_config={"response_mime_type": "application/json"}
         )
+        
+        # デバッグモード時：生の回答を表示
+        if debug_mode:
+            st.text(f"--- {filename} のAI生回答 ---")
+            st.text(response.text)
+
         data_list = json.loads(response.text)
         
         # ファイル名を各データに追加
@@ -155,6 +165,8 @@ def extract_data_with_ai(pdf_path, filename):
             
         return data_list
     except Exception as e:
+        if debug_mode:
+            st.error(f"JSON変換エラー: {e}")
         return []
 
 # --- メイン処理 ---
@@ -185,7 +197,9 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     filename = os.path.basename(pdf_path)
                     status_text.text(f"分析中 ({i+1}/{len(downloaded_files)}): {filename}")
                     
-                    extracted_list = extract_data_with_ai(pdf_path, filename)
+                    # デバッグモード設定を渡す
+                    extracted_list = extract_data_with_ai(pdf_path, filename, debug_mode)
+                    
                     if extracted_list:
                         all_extracted_data.extend(extracted_list)
                     
@@ -230,4 +244,4 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                 else:
-                    st.error("データの抽出に失敗しました。条件に合う実績データが見つからなかった可能性があります。")
+                    st.error("データの抽出に失敗しました。サイドバーの「デバッグモード」をオンにして再実行し、AIの回答を確認してください。")
