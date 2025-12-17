@@ -10,34 +10,57 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 import datetime
+import gc  # メモリ解放用
 
 # --- 画面設定 ---
 st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
 
-st.title("📄 PDF一括ダウンローダー & AI台帳作成")
+st.title("📄 PDF一括ダウンローダー & AI台帳作成（全自動版）")
 st.markdown("""
-指定URLからPDFを収集し、**前年度実績（報告書情報）**の数値を抽出してExcel化します。
-実行結果は画面下の「実行履歴」に保存され、**まとめて結合ダウンロード**も可能です。
+指定URLからPDFを収集し、**前年度実績（報告書情報）**を抽出します。
+**「全自動実行」**ボタンを押すと、完了するまで自動で分割処理（バッチ処理）を継続します。
+※処理中はブラウザを閉じないでください。
 """)
 
-# --- セッションステート（履歴保存用）の初期化 ---
+# --- セッションステート初期化 ---
 if 'history' not in st.session_state:
     st.session_state['history'] = []
+if 'processed_urls' not in st.session_state:
+    st.session_state['processed_urls'] = set()
+if 'is_running' not in st.session_state:
+    st.session_state['is_running'] = False # 実行中フラグ
 
 # --- サイドバー：設定 ---
 with st.sidebar:
     st.header("設定")
     
-    # SecretsからAPIキーを読み込む（なければ入力欄表示）
     if "GEMINI_API_KEY" in st.secrets:
         api_key = st.secrets["GEMINI_API_KEY"]
         st.success("🔑 APIキーを自動で読み込みました")
     else:
         api_key = st.text_input("Gemini APIキー", type="password", help="Google AI Studioで取得したキーを入力してください")
 
-    # 履歴クリアボタン
-    if st.button("🗑️ 履歴をクリア"):
+    st.markdown("---")
+    st.subheader("処理設定")
+    batch_size = st.number_input(
+        "1回の処理単位（バッチサイズ）", 
+        min_value=1, 
+        value=50, 
+        step=10, 
+        help="メモリ不足を防ぐため、50件程度ごとにメモリ解放を行います。"
+    )
+
+    st.markdown("---")
+    # 強制停止ボタン
+    if st.session_state['is_running']:
+        if st.button("🛑 処理を中断する"):
+            st.session_state['is_running'] = False
+            st.warning("中断命令を出しました。現在のバッチが終わり次第停止します。")
+
+    if st.button("🗑️ 履歴と記憶を全クリア"):
         st.session_state['history'] = []
+        st.session_state['processed_urls'] = set()
+        st.session_state['is_running'] = False
         st.rerun()
 
     if api_key:
@@ -47,33 +70,28 @@ with st.sidebar:
 # --- ユーザー入力欄 ---
 col1, col2 = st.columns([2, 1])
 with col1:
-    default_url = "https://www.city.fukuoka.lg.jp/kankyo/sanhai/hp/sangyouhaikibutu/haisyutujigyousya/taryoukouhyou.html"
+    default_url = "https://www.pref.kagoshima.jp/aq21/kurashi-kankyo/kankyo/sangyo/seibi/r6_public.html"
     target_url = st.text_input("対象のURL", default_url)
 with col2:
     keyword = st.text_input("ファイル名に含む文字", "06")
 
-# --- 関数：PDFダウンロード ---
-def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
+# --- 関数群 ---
+def get_pdf_links(target_url, keyword):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-        "Referer": "https://www.google.com/"
     }
-    
-    status_text.text("サイトの情報を取得中...")
     try:
-        response = requests.get(target_url, headers=headers, timeout=10)
+        response = requests.get(target_url, headers=headers, timeout=15)
         response.raise_for_status()
     except Exception as e:
-        st.error(f"接続エラー: {e}")
+        st.error(f"サイトへの接続に失敗しました: {e}")
         return []
     
     response.encoding = response.apparent_encoding
     soup = BeautifulSoup(response.content, "html.parser")
     links = soup.find_all("a")
     
-    download_targets = []
+    target_urls = []
     for link in links:
         href = link.get("href")
         if href and href.lower().endswith(".pdf"):
@@ -85,54 +103,36 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
                 pass
             
             if not keyword or keyword in filename:
-                download_targets.append((filename, full_url))
-    
-    download_targets = list(set(download_targets))
-    if not download_targets:
-        return []
-    
-    downloaded_files = []
-    status_text.text(f"{len(download_targets)} 件のPDFが見つかりました。ダウンロード中...")
-    
-    for i, (filename, url) in enumerate(download_targets):
-        try:
-            file_res = requests.get(url, headers=headers, timeout=10)
-            file_path = os.path.join(save_dir, filename)
-            with open(file_path, "wb") as f:
-                f.write(file_res.content)
-            downloaded_files.append(file_path)
-            progress_bar.progress((i + 1) / len(download_targets))
-            time.sleep(1)
-        except Exception as e:
-            st.warning(f"{filename} の取得失敗: {e}")
-            
-    return downloaded_files
+                target_urls.append((filename, full_url))
+                
+    return list(set(target_urls))
 
-# --- 関数：AIによる抽出（項目追加版） ---
 def extract_data_with_ai(pdf_path, filename):
-    # Gemini 2.5 Flash (Experimental) を優先
+    # モデル設定
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
     except:
         model = genai.GenerativeModel('gemini-flash-latest')
 
+    # アップロード
     try:
         sample_file = genai.upload_file(path=pdf_path, display_name=filename)
+        # 待機
+        timeout_counter = 0
         while sample_file.state.name == "PROCESSING":
             time.sleep(1)
+            timeout_counter += 1
             sample_file = genai.get_file(sample_file.name)
+            if timeout_counter > 30: # 30秒以上かかったらタイムアウト
+                return []
         
         if sample_file.state.name == "FAILED":
-            st.error(f"【{filename}】ファイルのアップロード処理に失敗しました。")
             return []
-            
-    except Exception as e:
-        st.error(f"【{filename}】アップロードエラー: {e}")
+    except Exception:
         return []
 
-    # プロンプト（指示書）
     prompt = """
-    あなたはデータ入力の専門家です。このPDF（産業廃棄物処理計画書・報告書）から、以下の情報を正確に抽出・転記してください。
+    あなたはデータ入力の専門家です。PDFから以下の情報を正確に抽出・転記してください。
 
     【最重要ルール】
     表には「①現状（前年度実績）」と「②計画（目標）」の2つの列が並んでいる場合があります。
@@ -141,15 +141,15 @@ def extract_data_with_ai(pdf_path, filename):
 
     【抽出項目定義】
     1. **提出日**: 表紙の右上にある日付（例：令和6年5月21日）。
-    2. **対象年度**: 「①現状」や「実績」が指している年度。通常は提出日の前年度（例：令和5年度）。
+    2. **対象年度**: 「①現状」や「実績」が指している年度。
     3. **文書種類**: 全て「報告書」として出力してください。
-    4. **事業の種類**: 第1面などの「事業の種類」欄から抽出（例：建設業、総合工事業など）。
+    4. **事業の種類**: 「事業の種類」欄から抽出。
     5. **事業場名**: 「事業場の名称」または「工場名・事業所名」を抽出。
-    6. **住所**: 「事業場の所在地」を抽出。なければ代表者の住所でも可。
-    7. **廃棄物の種類ごとの行作成**: 表にある全ての「産業廃棄物の種類」について、1種類につき1つのデータ（行）を作成してください。合計行は不要です。
+    6. **住所**: 「事業場の所在地」を抽出。
+    7. **廃棄物の種類ごとの行作成**: 産業廃棄物の種類ごとに1行作成。合計行は不要。
 
     【出力フォーマット】
-    以下のJSON形式のリスト（配列）のみを出力してください。Markdown記法（```json）は不要です。
+    JSON形式のリスト（配列）のみ出力。
     
     [
       {
@@ -176,33 +176,19 @@ def extract_data_with_ai(pdf_path, filename):
         # 生成実行
         try:
             model = genai.GenerativeModel('gemini-2.5-flash')
-            response = model.generate_content(
-                [sample_file, prompt],
-                generation_config={"response_mime_type": "application/json"}
-            )
+            response = model.generate_content([sample_file, prompt], generation_config={"response_mime_type": "application/json"})
         except Exception:
             model = genai.GenerativeModel('gemini-flash-latest')
-            response = model.generate_content(
-                [sample_file, prompt],
-                generation_config={"response_mime_type": "application/json"}
-            )
+            response = model.generate_content([sample_file, prompt], generation_config={"response_mime_type": "application/json"})
         
-        # JSON変換
         data_list = json.loads(response.text)
-        
         for item in data_list:
             item['ファイル名'] = filename
-            
         return data_list
 
-    except Exception as e:
-        st.error(f"❌ 【{filename}】解析エラー: {e}")
-        if 'response' in locals():
-            with st.expander("⚠️ AIの生回答（エラー原因の確認用）"):
-                st.text(response.text)
+    except Exception:
         return []
 
-# --- データ変換関数（Excel用） ---
 def convert_df_to_excel(df):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
         df.to_excel(tmp.name, index=False)
@@ -210,56 +196,104 @@ def convert_df_to_excel(df):
             data = f.read()
     return data
 
-# --- メイン処理 ---
-if st.button("🚀 ダウンロード & データ抽出を開始"):
-    if not api_key:
-        st.error("AI抽出を行うには、サイドバーでAPIキーを設定してください。")
-    else:
-        status_text = st.empty()
-        progress_bar = st.progress(0)
+# --- 事前情報取得エリア ---
+st.markdown("---")
+st.subheader("📊 実行ステータス")
 
+if target_url:
+    # リンク全取得
+    all_pdf_links = get_pdf_links(target_url, keyword)
+    total_count = len(all_pdf_links)
+    
+    # 処理済み計算
+    processed_set = st.session_state['processed_urls']
+    unprocessed_links = [link for link in all_pdf_links if link[1] not in processed_set]
+    remaining_count = len(unprocessed_links)
+    processed_count = total_count - remaining_count
+    
+    # 画面表示
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("対象PDF総数", f"{total_count} 件")
+    col_b.metric("完了", f"{processed_count} 件")
+    col_c.metric("残り", f"{remaining_count} 件")
+    
+    # 全体進捗バー
+    overall_progress = st.progress(0)
+    if total_count > 0:
+        overall_progress.progress(processed_count / total_count)
+    
+    # 実行ボタン
+    if remaining_count > 0:
+        if not st.session_state['is_running']:
+            if st.button("🚀 全自動実行を開始する", type="primary"):
+                if not api_key:
+                    st.error("APIキーを設定してください")
+                else:
+                    st.session_state['is_running'] = True
+                    st.rerun()
+    else:
+        st.success("✅ すべての処理が完了しています！")
+
+# --- 自動ループ処理ロジック ---
+if st.session_state['is_running']:
+    # プレースホルダー（進捗表示用）
+    status_box = st.empty()
+    batch_progress = st.progress(0)
+    
+    while remaining_count > 0:
+        # 中断チェック
+        if not st.session_state['is_running']:
+            status_box.warning("処理を中断しました。")
+            break
+
+        # 今回のバッチを作成
+        next_batch = unprocessed_links[:int(batch_size)]
+        
+        status_box.info(f"🔄 自動処理中... 残り {remaining_count} 件中、今回のバッチ {len(next_batch)} 件を実行します。")
+        
+        # --- バッチ処理開始 ---
         with tempfile.TemporaryDirectory() as temp_dir:
             save_dir = os.path.join(temp_dir, "pdfs")
             os.makedirs(save_dir, exist_ok=True)
             
-            # 1. ダウンロード
-            downloaded_files = download_pdfs(target_url, keyword, save_dir, status_text, progress_bar)
+            downloaded_files = []
+            headers = {"User-Agent": "Mozilla/5.0"}
             
-            if not downloaded_files:
-                st.warning("条件に合うPDFが見つかりませんでした。")
-            else:
-                status_text.text("AIによるデータ抽出を開始します...")
-                progress_bar.progress(0)
+            # 1. ダウンロード
+            for i, (fname, furl) in enumerate(next_batch):
+                try:
+                    res = requests.get(furl, headers=headers, timeout=10)
+                    fpath = os.path.join(save_dir, fname)
+                    with open(fpath, "wb") as f:
+                        f.write(res.content)
+                    downloaded_files.append(fpath)
+                    st.session_state['processed_urls'].add(furl) # 処理済みに登録
+                except Exception:
+                    pass # エラーでも止まらず次へ
                 
-                all_extracted_data = []
+                # バッチ内進捗更新
+                batch_progress.progress((i + 1) / len(next_batch) * 0.5) # 前半50%
+            
+            # 2. AI解析
+            if downloaded_files:
+                batch_data = []
+                for i, fpath in enumerate(downloaded_files):
+                    fname = os.path.basename(fpath)
+                    extracted = extract_data_with_ai(fpath, fname)
+                    if extracted:
+                        batch_data.extend(extracted)
+                    
+                    # バッチ内進捗更新
+                    batch_progress.progress(0.5 + (i + 1) / len(downloaded_files) * 0.5) # 後半50%
                 
-                # 2. AI抽出ループ
-                for i, pdf_path in enumerate(downloaded_files):
-                    filename = os.path.basename(pdf_path)
-                    status_text.text(f"分析中 ({i+1}/{len(downloaded_files)}): {filename}")
-                    
-                    extracted_list = extract_data_with_ai(pdf_path, filename)
-                    
-                    if extracted_list:
-                        all_extracted_data.extend(extracted_list)
-                    
-                    progress_bar.progress((i + 1) / len(downloaded_files))
-                
-                # 3. データ整形と保存
-                if all_extracted_data:
-                    df = pd.DataFrame(all_extracted_data)
-                    
-                    # カラムの並び順とリネーム設定（ここに追加項目を反映）
+                # 3. 結果保存
+                if batch_data:
+                    df = pd.DataFrame(batch_data)
+                    # 列整理
                     column_mapping = {
-                        'ファイル名': 'ファイル名',
-                        '自治体名': '自治体名',
-                        '提出日': '提出日',
-                        '対象年度': '対象年度',
-                        '文書種類': '種類',
-                        '事業の種類': '事業の種類',               # 【追加】
-                        '排出事業者名': '排出事業者名',
-                        '事業場名': '事業場名',                   # 【追加】
-                        '住所': '住所',                           # 【追加】
+                        'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
+                        '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
+                        '排出事業者名': '排出事業者名', '事業場名': '事業場名', '住所': '住所',
                         '廃棄物の種類': '廃棄物の種類',
                         '⑩全処理委託量_ton': '⑩全処理委託量(t)',
                         '⑪優良認定処理業者への処理委託量_ton': '⑪優良認定(t)',
@@ -268,59 +302,66 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                         '⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton': '⑭熱回収その他(t)',
                         '備考': '備考'
                     }
-                    
                     target_cols = [c for c in column_mapping.keys() if c in df.columns]
-                    df = df[target_cols]
-                    df = df.rename(columns=column_mapping)
+                    df = df[target_cols].rename(columns=column_mapping)
                     
-                    # 履歴に保存
                     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    history_item = {
+                    st.session_state['history'].append({
                         "time": now,
                         "keyword": keyword,
                         "count": len(df),
                         "df": df
-                    }
-                    st.session_state['history'].append(history_item)
-                    
-                    st.success(f"🎉 処理完了！ {len(df)} 件の実績データを抽出しました。")
-                else:
-                    st.error("データの抽出に失敗しました。上のエラーメッセージを確認してください。")
+                    })
+        
+        # --- メモリ解放 ---
+        del downloaded_files
+        del batch_data
+        gc.collect()
+        
+        # 残り件数を再計算
+        unprocessed_links = [link for link in all_pdf_links if link[1] not in st.session_state['processed_urls']]
+        remaining_count = len(unprocessed_links)
+        
+        # 全体進捗バー更新
+        processed_count = total_count - remaining_count
+        if total_count > 0:
+            overall_progress.progress(processed_count / total_count)
+            
+        # 完了チェック
+        if remaining_count == 0:
+            st.session_state['is_running'] = False
+            status_box.success("🎉 全件の処理が完了しました！")
+            st.rerun()
+            break
+        else:
+            # サーバー負荷軽減のため少し待機してから次へ
+            time.sleep(1)
 
 # --- 実行履歴エリア ---
 st.markdown("---")
-st.subheader("📂 実行履歴")
+st.subheader("📂 実行履歴 & 統合ダウンロード")
 
-if len(st.session_state['history']) == 0:
-    st.write("履歴はまだありません。")
-else:
-    if len(st.session_state['history']) > 1:
-        st.info("💡 複数の抽出結果があります。これらを1つのファイルにまとめてダウンロードできます。")
-        
-        all_dfs = [item['df'] for item in st.session_state['history']]
-        merged_df = pd.concat(all_dfs, ignore_index=True)
-        
-        merged_excel = convert_df_to_excel(merged_df)
-        now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        st.download_button(
-            label="📦 履歴をすべて結合してダウンロード (Merge All)",
-            data=merged_excel,
-            file_name=f"waste_report_merged_{now_str}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_all_btn"
-        )
-        st.markdown("---")
-
-    for i, item in enumerate(reversed(st.session_state['history'])):
-        with st.expander(f"【{item['time']}】キーワード: {item['keyword']} (抽出数: {item['count']}件)"):
+if len(st.session_state['history']) > 0:
+    all_dfs = [item['df'] for item in st.session_state['history']]
+    merged_df = pd.concat(all_dfs, ignore_index=True)
+    
+    st.info(f"現在、合計 **{len(merged_df)} 行** のデータが抽出されています。")
+    
+    merged_excel = convert_df_to_excel(merged_df)
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    st.download_button(
+        label="📦 すべての結果を結合してExcelダウンロード",
+        data=merged_excel,
+        file_name=f"waste_report_TOTAL_{now_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_total_btn",
+        type="primary"
+    )
+    
+    with st.expander("個別の履歴を見る"):
+        for i, item in enumerate(reversed(st.session_state['history'])):
+            st.write(f"**{item['time']}** - {item['count']}件")
             st.dataframe(item['df'])
-            
-            excel_data = convert_df_to_excel(item['df'])
-            st.download_button(
-                label=f"📥 このExcelをダウンロード",
-                data=excel_data,
-                file_name=f"waste_report_{item['time'].replace(':','-')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_btn_{i}"
-            )
+else:
+    st.write("履歴はありません。")
