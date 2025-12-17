@@ -108,7 +108,7 @@ def download_pdfs(target_url, keyword, save_dir, status_text, progress_bar):
             
     return downloaded_files
 
-# --- 関数：AIによる抽出（エラー自動表示版） ---
+# --- 関数：AIによる抽出（項目追加版） ---
 def extract_data_with_ai(pdf_path, filename):
     # Gemini 2.5 Flash (Experimental) を優先
     try:
@@ -132,7 +132,7 @@ def extract_data_with_ai(pdf_path, filename):
 
     # プロンプト（指示書）
     prompt = """
-    あなたはデータ入力の専門家です。このPDF（産業廃棄物処理計画書・報告書）の「別紙」にある表から、数値を正確に転記してください。
+    あなたはデータ入力の専門家です。このPDF（産業廃棄物処理計画書・報告書）から、以下の情報を正確に抽出・転記してください。
 
     【最重要ルール】
     表には「①現状（前年度実績）」と「②計画（目標）」の2つの列が並んでいる場合があります。
@@ -143,7 +143,10 @@ def extract_data_with_ai(pdf_path, filename):
     1. **提出日**: 表紙の右上にある日付（例：令和6年5月21日）。
     2. **対象年度**: 「①現状」や「実績」が指している年度。通常は提出日の前年度（例：令和5年度）。
     3. **文書種類**: 全て「報告書」として出力してください。
-    4. **廃棄物の種類ごとの行作成**: 表にある全ての「産業廃棄物の種類」について、1種類につき1つのデータ（行）を作成してください。合計行は不要です。
+    4. **事業の種類**: 第1面などの「事業の種類」欄から抽出（例：建設業、総合工事業など）。
+    5. **事業場名**: 「事業場の名称」または「工場名・事業所名」を抽出。
+    6. **住所**: 「事業場の所在地」を抽出。なければ代表者の住所でも可。
+    7. **廃棄物の種類ごとの行作成**: 表にある全ての「産業廃棄物の種類」について、1種類につき1つのデータ（行）を作成してください。合計行は不要です。
 
     【出力フォーマット】
     以下のJSON形式のリスト（配列）のみを出力してください。Markdown記法（```json）は不要です。
@@ -154,6 +157,9 @@ def extract_data_with_ai(pdf_path, filename):
         "対象年度": "令和5年度",
         "文書種類": "報告書",
         "排出事業者名": "株式会社〇〇",
+        "事業の種類": "総合工事業",
+        "事業場名": "福岡支店",
+        "住所": "福岡市博多区...",
         "廃棄物の種類": "がれき類",
         "⑩全処理委託量_ton": 1299.99,
         "⑪優良認定処理業者への処理委託量_ton": 0,
@@ -175,15 +181,13 @@ def extract_data_with_ai(pdf_path, filename):
                 generation_config={"response_mime_type": "application/json"}
             )
         except Exception:
-            # モデルエラー時は警告を出すだけにして、代替モデルで再試行
-            # st.warning("gemini-2.5-flash が利用できないため、gemini-flash-latest を使用します。") 
             model = genai.GenerativeModel('gemini-flash-latest')
             response = model.generate_content(
                 [sample_file, prompt],
                 generation_config={"response_mime_type": "application/json"}
             )
         
-        # JSON変換を試みる
+        # JSON変換
         data_list = json.loads(response.text)
         
         for item in data_list:
@@ -192,10 +196,7 @@ def extract_data_with_ai(pdf_path, filename):
         return data_list
 
     except Exception as e:
-        # 【重要】エラー発生時のみ、エラー詳細とAIの生回答を表示する
         st.error(f"❌ 【{filename}】解析エラー: {e}")
-        
-        # response変数が存在する場合（JSON変換手前で失敗した場合など）は、中身を表示して原因特定を助ける
         if 'response' in locals():
             with st.expander("⚠️ AIの生回答（エラー原因の確認用）"):
                 st.text(response.text)
@@ -237,7 +238,6 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                     filename = os.path.basename(pdf_path)
                     status_text.text(f"分析中 ({i+1}/{len(downloaded_files)}): {filename}")
                     
-                    # デバッグモード引数は不要になったので削除
                     extracted_list = extract_data_with_ai(pdf_path, filename)
                     
                     if extracted_list:
@@ -249,13 +249,17 @@ if st.button("🚀 ダウンロード & データ抽出を開始"):
                 if all_extracted_data:
                     df = pd.DataFrame(all_extracted_data)
                     
+                    # カラムの並び順とリネーム設定（ここに追加項目を反映）
                     column_mapping = {
                         'ファイル名': 'ファイル名',
                         '自治体名': '自治体名',
                         '提出日': '提出日',
                         '対象年度': '対象年度',
                         '文書種類': '種類',
+                        '事業の種類': '事業の種類',               # 【追加】
                         '排出事業者名': '排出事業者名',
+                        '事業場名': '事業場名',                   # 【追加】
+                        '住所': '住所',                           # 【追加】
                         '廃棄物の種類': '廃棄物の種類',
                         '⑩全処理委託量_ton': '⑩全処理委託量(t)',
                         '⑪優良認定処理業者への処理委託量_ton': '⑪優良認定(t)',
