@@ -13,12 +13,12 @@ import datetime
 import gc  # メモリ解放用
 
 # --- 画面設定 ---
-st.set_page_config(page_title="PDF一括DL & AI抽出", layout="wide")
+st.set_page_config(page_title="産廃報告書AI抽出アプリ", layout="wide")
 
-st.title("📄 PDFデータ抽出・台帳作成アプリ")
+st.title("📄 産廃報告書データ抽出・台帳作成アプリ")
 st.markdown("""
-**「URLからの自動収集」** または **「手持ちPDFのアップロード」** のどちらからでも、
-AIが報告書データを抽出し、1つのExcel台帳にまとめます。
+**「Web自動収集」** または **「手動アップロード」** で、報告書データを抽出して一覧化します。
+**PDFファイル** と **Excelファイル** の両方に対応しています。
 """)
 
 # --- セッションステート初期化 ---
@@ -51,33 +51,59 @@ with st.sidebar:
     st.info("※APIキーがない場合、動作しません。")
 
 # --- 共通関数：AIによる抽出 ---
-def extract_data_with_ai(pdf_path, filename):
+def extract_data_with_ai(file_path, filename):
     # モデル設定
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
     except:
         model = genai.GenerativeModel('gemini-flash-latest')
 
-    # アップロード
-    try:
-        sample_file = genai.upload_file(path=pdf_path, display_name=filename)
-        # 待機
-        timeout_counter = 0
-        while sample_file.state.name == "PROCESSING":
-            time.sleep(1)
-            timeout_counter += 1
-            sample_file = genai.get_file(sample_file.name)
-            if timeout_counter > 30: 
-                return []
-        
-        if sample_file.state.name == "FAILED":
+    # ファイルタイプに応じた処理
+    file_ext = os.path.splitext(filename)[1].lower()
+    
+    content_to_send = None
+    mime_type = ""
+
+    # 1. PDFの場合
+    if file_ext == ".pdf":
+        try:
+            sample_file = genai.upload_file(path=file_path, display_name=filename)
+            timeout_counter = 0
+            while sample_file.state.name == "PROCESSING":
+                time.sleep(1)
+                timeout_counter += 1
+                sample_file = genai.get_file(sample_file.name)
+                if timeout_counter > 30: return []
+            
+            if sample_file.state.name == "FAILED": return []
+            
+            content_to_send = sample_file
+            mime_type = "pdf"
+        except Exception:
             return []
-    except Exception:
+
+    # 2. Excelの場合 (.xlsx, .xls)
+    elif file_ext in [".xlsx", ".xls"]:
+        try:
+            xls = pd.read_excel(file_path, sheet_name=None)
+            text_buffer = f"ファイル名: {filename}\n\n"
+            for sheet_name, df in xls.items():
+                text_buffer += f"--- Sheet: {sheet_name} ---\n"
+                text_buffer += df.to_csv(index=False)
+                text_buffer += "\n\n"
+            
+            content_to_send = text_buffer
+            mime_type = "text"
+        except Exception as e:
+            return []
+    
+    else:
         return []
 
-    # プロンプト（指示書）を修正：自治体名の抽出を追加
-    prompt = """
-    あなたはデータ入力の専門家です。PDFから以下の情報を正確に抽出・転記してください。
+    # プロンプト（指示書）
+    prompt_text = """
+    あなたはデータ入力の専門家です。提供された資料（産業廃棄物処理計画書・報告書）から、以下の情報を正確に抽出・転記してください。
+    資料はPDF、またはExcelから変換されたテキストデータです。
 
     【最重要ルール】
     表には「①現状（前年度実績）」と「②計画（目標）」の2つの列が並んでいる場合があります。
@@ -85,7 +111,7 @@ def extract_data_with_ai(pdf_path, filename):
     「②計画」や「【目標】」の列の数値は絶対に抽出しないでください。
 
     【抽出項目定義】
-    1. **提出日**: 表紙の右上にある日付（例：令和6年5月21日）。
+    1. **提出日**: 表紙の右上などにある日付（例：令和6年5月21日）。
     2. **対象年度**: 「①現状」や「実績」が指している年度。
     3. **文書種類**: 全て「報告書」として出力してください。
     4. **事業の種類**: 「事業の種類」欄から抽出。
@@ -95,7 +121,7 @@ def extract_data_with_ai(pdf_path, filename):
     8. **廃棄物の種類ごとの行作成**: 産業廃棄物の種類ごとに1行作成。合計行は不要。
 
     【出力フォーマット】
-    JSON形式のリスト（配列）のみ出力。
+    JSON形式のリスト（配列）のみ出力。Markdown記法不要。
     
     [
       {
@@ -119,19 +145,24 @@ def extract_data_with_ai(pdf_path, filename):
     """
     
     try:
-        try:
-            model = genai.GenerativeModel('gemini-2.5-flash')
-            response = model.generate_content([sample_file, prompt], generation_config={"response_mime_type": "application/json"})
-        except Exception:
-            model = genai.GenerativeModel('gemini-flash-latest')
-            response = model.generate_content([sample_file, prompt], generation_config={"response_mime_type": "application/json"})
-        
+        if mime_type == "pdf":
+            try:
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                response = model.generate_content([content_to_send, prompt_text], generation_config={"response_mime_type": "application/json"})
+            except:
+                model = genai.GenerativeModel('gemini-flash-latest')
+                response = model.generate_content([content_to_send, prompt_text], generation_config={"response_mime_type": "application/json"})
+        else:
+            try:
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                response = model.generate_content([prompt_text, f"以下はExcelデータの内容です:\n{content_to_send}"], generation_config={"response_mime_type": "application/json"})
+            except:
+                model = genai.GenerativeModel('gemini-flash-latest')
+                response = model.generate_content([prompt_text, f"以下はExcelデータの内容です:\n{content_to_send}"], generation_config={"response_mime_type": "application/json"})
+
         data_list = json.loads(response.text)
         for item in data_list:
             item['ファイル名'] = filename
-            # 【修正】ここで「手動アップロード分」と上書きしていた処理を削除しました。
-            # AIが抽出した「自治体名」がそのまま使われます。
-            
         return data_list
 
     except Exception:
@@ -147,16 +178,16 @@ def convert_df_to_excel(df):
 # ==========================================
 # タブで機能を切り替え
 # ==========================================
-tab1, tab2 = st.tabs(["📂 PDFアップロード分析", "🌐 URLから自動収集"])
+tab1, tab2 = st.tabs(["📂 ファイルアップロード分析", "🌐 URLから自動収集"])
 
 # ------------------------------------------
 # タブ1：手動アップロード機能
 # ------------------------------------------
 with tab1:
-    st.subheader("手持ちのPDFファイルを分析")
-    st.write("パソコンにあるPDFファイルをドラッグ＆ドロップしてください（複数可）。")
+    st.subheader("手持ちのファイルを分析")
+    st.write("PDF または Excelファイル(.xlsx, .xls) をドラッグ＆ドロップしてください。")
     
-    uploaded_files = st.file_uploader("PDFファイルを選択", type="pdf", accept_multiple_files=True)
+    uploaded_files = st.file_uploader("ファイルを選択", type=["pdf", "xlsx", "xls"], accept_multiple_files=True)
     
     if uploaded_files:
         st.info(f"{len(uploaded_files)} 件のファイルが選択されています。")
@@ -224,6 +255,7 @@ with tab1:
 # ------------------------------------------
 with tab2:
     st.subheader("Webサイトから自動収集")
+    st.write("対象URLにある PDF および Excelファイル を自動収集します。")
     
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -234,7 +266,8 @@ with tab2:
 
     batch_size = st.number_input("自動処理のバッチサイズ", min_value=1, value=50, step=10)
 
-    def get_pdf_links(target_url, keyword):
+    # リンク取得関数（Excel対応版）
+    def get_file_links(target_url, keyword):
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
             response = requests.get(target_url, headers=headers, timeout=15)
@@ -245,25 +278,30 @@ with tab2:
             target_urls = []
             for link in links:
                 href = link.get("href")
-                if href and href.lower().endswith(".pdf"):
-                    full_url = urllib.parse.urljoin(target_url, href)
-                    filename = os.path.basename(urllib.parse.urlparse(full_url).path)
-                    try: filename = urllib.parse.unquote(filename)
-                    except: pass
-                    if not keyword or keyword in filename:
-                        target_urls.append((filename, full_url))
+                # 【修正】PDFだけでなく、Excelファイルも対象にする
+                if href:
+                    href_lower = href.lower()
+                    if href_lower.endswith(".pdf") or href_lower.endswith(".xlsx") or href_lower.endswith(".xls"):
+                        full_url = urllib.parse.urljoin(target_url, href)
+                        filename = os.path.basename(urllib.parse.urlparse(full_url).path)
+                        try: filename = urllib.parse.unquote(filename)
+                        except: pass
+                        
+                        if not keyword or keyword in filename:
+                            target_urls.append((filename, full_url))
             return list(set(target_urls))
         except Exception as e:
             st.error(f"エラー: {e}")
             return []
 
     if target_url:
-        all_pdf_links = get_pdf_links(target_url, keyword)
+        # 関数名変更に合わせて呼び出し元も変更
+        all_file_links = get_file_links(target_url, keyword)
         processed_set = st.session_state['processed_urls']
-        unprocessed_links = [link for link in all_pdf_links if link[1] not in processed_set]
+        unprocessed_links = [link for link in all_file_links if link[1] not in processed_set]
         remaining_count = len(unprocessed_links)
         
-        st.caption(f"対象PDF総数: {len(all_pdf_links)}件 / 完了: {len(all_pdf_links)-remaining_count}件 / 残り: {remaining_count}件")
+        st.caption(f"対象ファイル総数: {len(all_file_links)}件 / 完了: {len(all_file_links)-remaining_count}件 / 残り: {remaining_count}件")
 
         if remaining_count > 0:
             if not st.session_state['is_running']:
@@ -281,7 +319,7 @@ with tab2:
                 status_box.info(f"🔄 自動処理中... 残り {remaining_count} 件")
                 
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    save_dir = os.path.join(temp_dir, "pdfs")
+                    save_dir = os.path.join(temp_dir, "downloads")
                     os.makedirs(save_dir, exist_ok=True)
                     downloaded_files = []
                     headers = {"User-Agent": "Mozilla/5.0"}
@@ -328,7 +366,8 @@ with tab2:
                 
                 del downloaded_files
                 gc.collect()
-                unprocessed_links = [link for link in all_pdf_links if link[1] not in st.session_state['processed_urls']]
+                # リスト更新
+                unprocessed_links = [link for link in all_file_links if link[1] not in st.session_state['processed_urls']]
                 remaining_count = len(unprocessed_links)
                 
                 if remaining_count == 0:
@@ -350,7 +389,7 @@ if len(st.session_state['history']) > 0:
     all_dfs = [item['df'] for item in st.session_state['history']]
     merged_df = pd.concat(all_dfs, ignore_index=True)
     
-    st.info(f"💡 URL抽出分・手動アップロード分あわせて、現在合計 **{len(merged_df)} 行** のデータがあります。")
+    st.info(f"💡 現在合計 **{len(merged_df)} 行** のデータがあります。")
     
     merged_excel = convert_df_to_excel(merged_df)
     now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
