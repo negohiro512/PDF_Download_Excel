@@ -75,6 +75,7 @@ def extract_data_with_ai(pdf_path, filename):
     except Exception:
         return []
 
+    # プロンプト（指示書）を修正：自治体名の抽出を追加
     prompt = """
     あなたはデータ入力の専門家です。PDFから以下の情報を正確に抽出・転記してください。
 
@@ -90,7 +91,8 @@ def extract_data_with_ai(pdf_path, filename):
     4. **事業の種類**: 「事業の種類」欄から抽出。
     5. **事業場名**: 「事業場の名称」または「工場名・事業所名」を抽出。
     6. **住所**: 「事業場の所在地」を抽出。
-    7. **廃棄物の種類ごとの行作成**: 産業廃棄物の種類ごとに1行作成。合計行は不要。
+    7. **自治体名**: 書類の宛名（例：「福岡市長 殿」）やヘッダーから、提出先の自治体名を抽出してください（例：「福岡市」）。
+    8. **廃棄物の種類ごとの行作成**: 産業廃棄物の種類ごとに1行作成。合計行は不要。
 
     【出力フォーマット】
     JSON形式のリスト（配列）のみ出力。
@@ -110,7 +112,7 @@ def extract_data_with_ai(pdf_path, filename):
         "⑫再生利用業者への処理委託量_ton": 1299.99,
         "⑬熱回収認定業者への処理委託量_ton": 0,
         "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
-        "自治体名": "手動アップロード分",
+        "自治体名": "福岡市",
         "備考": ""
       }
     ]
@@ -127,9 +129,9 @@ def extract_data_with_ai(pdf_path, filename):
         data_list = json.loads(response.text)
         for item in data_list:
             item['ファイル名'] = filename
-            # 自治体名が取れない場合があるので補完
-            if '自治体名' not in item or not item['自治体名']:
-                 item['自治体名'] = "手動アップロード分"
+            # 【修正】ここで「手動アップロード分」と上書きしていた処理を削除しました。
+            # AIが抽出した「自治体名」がそのまま使われます。
+            
         return data_list
 
     except Exception:
@@ -166,7 +168,6 @@ with tab1:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
-                # 一時ディレクトリで処理
                 with tempfile.TemporaryDirectory() as temp_dir:
                     save_dir = os.path.join(temp_dir, "uploads")
                     os.makedirs(save_dir, exist_ok=True)
@@ -175,12 +176,10 @@ with tab1:
                     status_text.text("AIによる分析を開始します...")
                     
                     for i, uploaded_file in enumerate(uploaded_files):
-                        # ファイルを一時保存
                         file_path = os.path.join(save_dir, uploaded_file.name)
                         with open(file_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
                         
-                        # AI解析
                         status_text.text(f"分析中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}")
                         extracted = extract_data_with_ai(file_path, uploaded_file.name)
                         if extracted:
@@ -188,10 +187,8 @@ with tab1:
                         
                         progress_bar.progress((i + 1) / len(uploaded_files))
                     
-                    # 結果保存
                     if batch_data:
                         df = pd.DataFrame(batch_data)
-                        # 列整理
                         column_mapping = {
                             'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
                             '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
@@ -220,11 +217,10 @@ with tab1:
                     else:
                         st.warning("データが抽出できませんでした。")
                     
-                    # メモリ掃除
                     gc.collect()
 
 # ------------------------------------------
-# タブ2：URL自動収集機能（既存機能）
+# タブ2：URL自動収集機能
 # ------------------------------------------
 with tab2:
     st.subheader("Webサイトから自動収集")
@@ -236,10 +232,8 @@ with tab2:
     with col2:
         keyword = st.text_input("ファイル名に含む文字", "06")
 
-    # バッチサイズ設定
     batch_size = st.number_input("自動処理のバッチサイズ", min_value=1, value=50, step=10)
 
-    # リンク取得関数
     def get_pdf_links(target_url, keyword):
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
@@ -277,7 +271,6 @@ with tab2:
                     st.session_state['is_running'] = True
                     st.rerun()
         
-        # 自動ループ処理
         if st.session_state['is_running']:
             status_box = st.empty()
             batch_progress = st.progress(0)
