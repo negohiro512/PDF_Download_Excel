@@ -50,23 +50,123 @@ with st.sidebar:
         genai.configure(api_key=api_key)
     st.info("※APIキーがない場合、動作しません。")
 
-# --- 共通関数：AIによる抽出 ---
-def extract_data_with_ai(file_path, filename):
-    # モデル設定
-    try:
-        model = genai.GenerativeModel('gemini-2.5-flash')
-    except:
-        model = genai.GenerativeModel('gemini-flash-latest')
+# ==========================================
+# ロジック関数群
+# ==========================================
 
+# --- 新機能：Excel強力読み取り関数 (AIを使わずPythonで構造解析) ---
+def read_excel_robust(file_path):
+    extracted_data = []
+    try:
+        # Excelファイルを全シート読み込み（.xls対応）
+        # ※ requirements.txt に xlrd >= 2.0.1 が必要
+        xls = pd.ExcelFile(file_path)
+        
+        for sheet_name in xls.sheet_names:
+            # ヘッダーなしでシート全体を読み込む
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
+            except Exception:
+                continue # 読み込めないシートはスキップ
+            
+            # --- キーワード探索 ---
+            target_row_idx = -1
+            col_mapping = {} 
+            
+            # 行ごとに「廃棄物の種類」という言葉を探す
+            for r_idx, row in df.iterrows():
+                row_str = row.astype(str).values
+                # 結合セルなどの汚れを取って判定
+                if any("廃棄物の種類" in s for s in row_str) or any("産業廃棄物の種類" in s for s in row_str):
+                    target_row_idx = r_idx
+                    
+                    # その行の中で、どの列に何があるか特定
+                    for c_idx, cell_val in enumerate(row_str):
+                        val = str(cell_val).replace("\n", "").replace(" ", "")
+                        if "種類" in val:
+                            col_mapping["kind"] = c_idx
+                        elif "全処理委託量" in val or "委託量" in val:
+                            col_mapping["amount"] = c_idx
+                    break 
+            
+            # 目印が見つかり、かつ必要な列が揃っている場合のみ抽出
+            if target_row_idx != -1 and "kind" in col_mapping and "amount" in col_mapping:
+                start_row = target_row_idx + 1
+                for i in range(start_row, len(df)):
+                    # 列インデックスが範囲内かチェック
+                    if col_mapping["kind"] >= len(df.columns) or col_mapping["amount"] >= len(df.columns):
+                        continue
+
+                    kind_val = df.iloc[i, col_mapping["kind"]]
+                    amount_val = df.iloc[i, col_mapping["amount"]]
+                    
+                    if pd.notna(kind_val) and pd.notna(amount_val):
+                        try:
+                            # 数値変換できるものだけ取得（「合計」行などを除外）
+                            amt_str = str(amount_val).replace(",", "").strip()
+                            amt = float(amt_str)
+                            
+                            waste_type = str(kind_val).strip()
+                            # 不要な行（小計など）を簡易フィルタ
+                            if "合計" in waste_type or waste_type == "":
+                                continue
+
+                            # 下流の処理に合わせて辞書を作成
+                            extracted_data.append({
+                                "提出日": "", # Excel直接読み込みでは取得困難なため空欄
+                                "対象年度": "",
+                                "文書種類": "報告書",
+                                "排出事業者名": "", # ファイル名で代用
+                                "事業の種類": "",
+                                "事業場名": "",
+                                "住所": "",
+                                "自治体名": "",
+                                "廃棄物の種類": waste_type,
+                                "⑩全処理委託量_ton": amt,
+                                "⑪優良認定処理業者への処理委託量_ton": 0,
+                                "⑫再生利用業者への処理委託量_ton": 0,
+                                "⑬熱回収認定業者への処理委託量_ton": 0,
+                                "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
+                                "備考": f"Sheet: {sheet_name}"
+                            })
+                        except ValueError:
+                            continue 
+
+    except Exception as e:
+        print(f"Excel read error: {e}")
+        return []
+        
+    return extracted_data
+
+# --- 共通関数：データ抽出の振り分け ---
+def extract_data_with_ai(file_path, filename):
     # ファイルタイプに応じた処理
     file_ext = os.path.splitext(filename)[1].lower()
     
-    content_to_send = None
-    mime_type = ""
+    # ------------------------------------------------
+    # 1. Excelの場合 (.xlsx, .xls) -> Pythonロジックを使用
+    # ------------------------------------------------
+    if file_ext in [".xlsx", ".xls"]:
+        data_list = read_excel_robust(file_path)
+        # ファイル名を付与
+        for item in data_list:
+            item['ファイル名'] = filename
+            # ファイル名から事業者名が推測できれば入れる（簡易処理）
+            if "排出事業者名" in item and not item["排出事業者名"]:
+                item["排出事業者名"] = filename
+        return data_list
 
-    # 1. PDFの場合
-    if file_ext == ".pdf":
+    # ------------------------------------------------
+    # 2. PDFの場合 -> Gemini (AI) を使用
+    # ------------------------------------------------
+    elif file_ext == ".pdf":
         try:
+            # モデル設定
+            try:
+                model = genai.GenerativeModel('gemini-2.5-flash')
+            except:
+                model = genai.GenerativeModel('gemini-flash-latest')
+
             sample_file = genai.upload_file(path=file_path, display_name=filename)
             timeout_counter = 0
             while sample_file.state.name == "PROCESSING":
@@ -78,94 +178,66 @@ def extract_data_with_ai(file_path, filename):
             if sample_file.state.name == "FAILED": return []
             
             content_to_send = sample_file
-            mime_type = "pdf"
-        except Exception:
-            return []
-
-    # 2. Excelの場合 (.xlsx, .xls)
-    elif file_ext in [".xlsx", ".xls"]:
-        try:
-            xls = pd.read_excel(file_path, sheet_name=None)
-            text_buffer = f"ファイル名: {filename}\n\n"
-            for sheet_name, df in xls.items():
-                text_buffer += f"--- Sheet: {sheet_name} ---\n"
-                text_buffer += df.to_csv(index=False)
-                text_buffer += "\n\n"
             
-            content_to_send = text_buffer
-            mime_type = "text"
-        except Exception as e:
+            # プロンプト（指示書）
+            prompt_text = """
+            あなたはデータ入力の専門家です。提供された資料（産業廃棄物処理計画書・報告書）から、以下の情報を正確に抽出・転記してください。
+
+            【最重要ルール】
+            表には「①現状（前年度実績）」と「②計画（目標）」の2つの列が並んでいる場合があります。
+            **必ず「①現状」または「【前年度実績】」と書かれている列の数値のみ**を抽出してください。
+            「②計画」や「【目標】」の列の数値は絶対に抽出しないでください。
+
+            【抽出項目定義】
+            1. **提出日**: 表紙の右上などにある日付（例：令和6年5月21日）。
+            2. **対象年度**: 「①現状」や「実績」が指している年度。
+            3. **文書種類**: 全て「報告書」として出力してください。
+            4. **事業の種類**: 「事業の種類」欄から抽出。
+            5. **事業場名**: 「事業場の名称」または「工場名・事業所名」を抽出。
+            6. **住所**: 「事業場の所在地」を抽出。
+            7. **自治体名**: 書類の宛名（例：「福岡市長 殿」）やヘッダーから、提出先の自治体名を抽出してください（例：「福岡市」）。
+            8. **廃棄物の種類ごとの行作成**: 産業廃棄物の種類ごとに1行作成。合計行は不要。
+
+            【出力フォーマット】
+            JSON形式のリスト（配列）のみ出力。Markdown記法不要。
+            
+            [
+              {
+                "提出日": "令和6年5月21日",
+                "対象年度": "令和5年度",
+                "文書種類": "報告書",
+                "排出事業者名": "株式会社〇〇",
+                "事業の種類": "総合工事業",
+                "事業場名": "福岡支店",
+                "住所": "福岡市博多区...",
+                "廃棄物の種類": "がれき類",
+                "⑩全処理委託量_ton": 1299.99,
+                "⑪優良認定処理業者への処理委託量_ton": 0,
+                "⑫再生利用業者への処理委託量_ton": 1299.99,
+                "⑬熱回収認定業者への処理委託量_ton": 0,
+                "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
+                "自治体名": "福岡市",
+                "備考": ""
+              }
+            ]
+            """
+
+            try:
+                response = model.generate_content([content_to_send, prompt_text], generation_config={"response_mime_type": "application/json"})
+            except:
+                # リトライ用
+                time.sleep(1)
+                response = model.generate_content([content_to_send, prompt_text], generation_config={"response_mime_type": "application/json"})
+
+            data_list = json.loads(response.text)
+            for item in data_list:
+                item['ファイル名'] = filename
+            return data_list
+
+        except Exception:
             return []
     
     else:
-        return []
-
-    # プロンプト（指示書）
-    prompt_text = """
-    あなたはデータ入力の専門家です。提供された資料（産業廃棄物処理計画書・報告書）から、以下の情報を正確に抽出・転記してください。
-    資料はPDF、またはExcelから変換されたテキストデータです。
-
-    【最重要ルール】
-    表には「①現状（前年度実績）」と「②計画（目標）」の2つの列が並んでいる場合があります。
-    **必ず「①現状」または「【前年度実績】」と書かれている列の数値のみ**を抽出してください。
-    「②計画」や「【目標】」の列の数値は絶対に抽出しないでください。
-
-    【抽出項目定義】
-    1. **提出日**: 表紙の右上などにある日付（例：令和6年5月21日）。
-    2. **対象年度**: 「①現状」や「実績」が指している年度。
-    3. **文書種類**: 全て「報告書」として出力してください。
-    4. **事業の種類**: 「事業の種類」欄から抽出。
-    5. **事業場名**: 「事業場の名称」または「工場名・事業所名」を抽出。
-    6. **住所**: 「事業場の所在地」を抽出。
-    7. **自治体名**: 書類の宛名（例：「福岡市長 殿」）やヘッダーから、提出先の自治体名を抽出してください（例：「福岡市」）。
-    8. **廃棄物の種類ごとの行作成**: 産業廃棄物の種類ごとに1行作成。合計行は不要。
-
-    【出力フォーマット】
-    JSON形式のリスト（配列）のみ出力。Markdown記法不要。
-    
-    [
-      {
-        "提出日": "令和6年5月21日",
-        "対象年度": "令和5年度",
-        "文書種類": "報告書",
-        "排出事業者名": "株式会社〇〇",
-        "事業の種類": "総合工事業",
-        "事業場名": "福岡支店",
-        "住所": "福岡市博多区...",
-        "廃棄物の種類": "がれき類",
-        "⑩全処理委託量_ton": 1299.99,
-        "⑪優良認定処理業者への処理委託量_ton": 0,
-        "⑫再生利用業者への処理委託量_ton": 1299.99,
-        "⑬熱回収認定業者への処理委託量_ton": 0,
-        "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
-        "自治体名": "福岡市",
-        "備考": ""
-      }
-    ]
-    """
-    
-    try:
-        if mime_type == "pdf":
-            try:
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                response = model.generate_content([content_to_send, prompt_text], generation_config={"response_mime_type": "application/json"})
-            except:
-                model = genai.GenerativeModel('gemini-flash-latest')
-                response = model.generate_content([content_to_send, prompt_text], generation_config={"response_mime_type": "application/json"})
-        else:
-            try:
-                model = genai.GenerativeModel('gemini-2.5-flash')
-                response = model.generate_content([prompt_text, f"以下はExcelデータの内容です:\n{content_to_send}"], generation_config={"response_mime_type": "application/json"})
-            except:
-                model = genai.GenerativeModel('gemini-flash-latest')
-                response = model.generate_content([prompt_text, f"以下はExcelデータの内容です:\n{content_to_send}"], generation_config={"response_mime_type": "application/json"})
-
-        data_list = json.loads(response.text)
-        for item in data_list:
-            item['ファイル名'] = filename
-        return data_list
-
-    except Exception:
         return []
 
 def convert_df_to_excel(df):
@@ -204,7 +276,7 @@ with tab1:
                     os.makedirs(save_dir, exist_ok=True)
                     
                     batch_data = []
-                    status_text.text("AIによる分析を開始します...")
+                    status_text.text("AIとPythonによる分析を開始します...")
                     
                     for i, uploaded_file in enumerate(uploaded_files):
                         file_path = os.path.join(save_dir, uploaded_file.name)
@@ -259,14 +331,14 @@ with tab2:
     
     col1, col2 = st.columns([2, 1])
     with col1:
-        default_url = "https://www.pref.kagoshima.jp/aq21/kurashi-kankyo/kankyo/sangyo/seibi/r6_public.html"
+        default_url = "https://www.pref.tokushima.lg.jp/jigyoshanokata/kurashi/recycling/7300999"
         target_url = st.text_input("対象のURL", default_url)
     with col2:
-        keyword = st.text_input("ファイル名に含む文字", "06")
+        keyword = st.text_input("ファイル名に含む文字", "")
 
     batch_size = st.number_input("自動処理のバッチサイズ", min_value=1, value=50, step=10)
 
-    # リンク取得関数（Excel対応版）
+    # リンク取得関数
     def get_file_links(target_url, keyword):
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
@@ -278,7 +350,6 @@ with tab2:
             target_urls = []
             for link in links:
                 href = link.get("href")
-                # 【修正】PDFだけでなく、Excelファイルも対象にする
                 if href:
                     href_lower = href.lower()
                     if href_lower.endswith(".pdf") or href_lower.endswith(".xlsx") or href_lower.endswith(".xls"):
@@ -295,7 +366,6 @@ with tab2:
             return []
 
     if target_url:
-        # 関数名変更に合わせて呼び出し元も変更
         all_file_links = get_file_links(target_url, keyword)
         processed_set = st.session_state['processed_urls']
         unprocessed_links = [link for link in all_file_links if link[1] not in processed_set]
