@@ -3,5 +3,4 @@ requests
 beautifulsoup4
 pandas
 openpyxl
-xlrd >= 2.0.1
 google-generativeai
