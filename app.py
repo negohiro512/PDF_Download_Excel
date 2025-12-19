@@ -29,6 +29,9 @@ if 'processed_urls' not in st.session_state:
     st.session_state['processed_urls'] = set()
 if 'is_running' not in st.session_state:
     st.session_state['is_running'] = False
+# 監査用：Web上の全ファイルリストを保持
+if 'all_target_files' not in st.session_state:
+    st.session_state['all_target_files'] = []
 
 # --- サイドバー：設定 ---
 with st.sidebar:
@@ -45,6 +48,7 @@ with st.sidebar:
         st.session_state['history'] = []
         st.session_state['processed_urls'] = set()
         st.session_state['is_running'] = False
+        st.session_state['all_target_files'] = []
         st.rerun()
 
     if api_key:
@@ -57,20 +61,14 @@ with st.sidebar:
 
 # --- ヘルパー：JSONクリーニング関数 ---
 def clean_json_response(text):
-    """AIが返すMarkdown記法や余計な文字を削除してJSON部分だけ取り出す"""
     text = text.strip()
-    # ```json ... ``` の削除
     if text.startswith("```json"):
         text = text[7:]
     if text.startswith("```"):
         text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
-    
-    # 前後の余白削除
     text = text.strip()
-    
-    # JSONの配列 [...] を探す
     match = re.search(r'\[.*\]', text, re.DOTALL)
     if match:
         return match.group(0)
@@ -81,21 +79,16 @@ def read_excel_robust(file_path):
     extracted_data = []
     try:
         xls = pd.ExcelFile(file_path)
-        
         for sheet_name in xls.sheet_names:
             try:
-                # ヘッダーなしでシート全体を読み込む
                 df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
             except Exception:
                 continue
             
-            # --- キーワード探索 ---
             target_row_idx = -1
             col_mapping = {} 
-            
             for r_idx, row in df.iterrows():
                 row_str = row.astype(str).values
-                # 結合セルなどの汚れを取って判定
                 if any("廃棄物の種類" in s for s in row_str) or any("産業廃棄物の種類" in s for s in row_str):
                     target_row_idx = r_idx
                     for c_idx, cell_val in enumerate(row_str):
@@ -106,54 +99,35 @@ def read_excel_robust(file_path):
                             col_mapping["amount"] = c_idx
                     break 
             
-            # 目印が見つかり、かつ必要な列が揃っている場合のみ抽出
             if target_row_idx != -1 and "kind" in col_mapping and "amount" in col_mapping:
                 start_row = target_row_idx + 1
                 for i in range(start_row, len(df)):
                     if col_mapping["kind"] >= len(df.columns) or col_mapping["amount"] >= len(df.columns):
                         continue
-
                     kind_val = df.iloc[i, col_mapping["kind"]]
                     amount_val = df.iloc[i, col_mapping["amount"]]
-                    
                     if pd.notna(kind_val) and pd.notna(amount_val):
                         try:
-                            # 数値変換できるものだけ取得
                             amt_str = str(amount_val).replace(",", "").strip()
                             amt = float(amt_str)
                             waste_type = str(kind_val).strip()
-                            
-                            # ゴミデータの排除
                             if "合計" in waste_type or waste_type == "" or waste_type == "nan":
                                 continue
-
                             extracted_data.append({
-                                "提出日": "",
-                                "対象年度": "",
-                                "文書種類": "報告書",
-                                "排出事業者名": "",
-                                "事業の種類": "",
-                                "事業場名": "",
-                                "住所": "",
-                                "自治体名": "",
-                                "廃棄物の種類": waste_type,
-                                "⑩全処理委託量_ton": amt,
-                                "備考": f"Sheet: {sheet_name}"
+                                "提出日": "", "対象年度": "", "文書種類": "報告書", "排出事業者名": "",
+                                "事業の種類": "", "事業場名": "", "住所": "", "自治体名": "",
+                                "廃棄物の種類": waste_type, "⑩全処理委託量_ton": amt, "備考": f"Sheet: {sheet_name}"
                             })
                         except ValueError:
                             continue 
-
     except Exception:
         return []
-        
     return extracted_data
-
 
 # --- 共通関数：データ抽出（ハイブリッド・完全版） ---
 def extract_data_with_ai(file_path, filename):
     file_ext = os.path.splitext(filename)[1].lower()
     
-    # 共通プロンプト：キー名を厳格に定義
     STRICT_PROMPT = """
     あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
     
@@ -184,13 +158,8 @@ def extract_data_with_ai(file_path, filename):
     ]
     """
 
-    # ------------------------------------------------
-    # 1. Excelの場合 (.xlsx, .xls)
-    # ------------------------------------------------
     if file_ext in [".xlsx", ".xls"]:
-        # 【STEP 1】Pythonロジック
         data_list = read_excel_robust(file_path)
-        
         if len(data_list) > 0:
             for item in data_list:
                 item['ファイル名'] = filename
@@ -198,7 +167,6 @@ def extract_data_with_ai(file_path, filename):
                     item["排出事業者名"] = filename
             return data_list
         
-        # 【STEP 2】AI救済モード
         try:
             xls = pd.read_excel(file_path, sheet_name=None)
             text_buffer = f"ファイル名: {filename}\n\n"
@@ -206,7 +174,6 @@ def extract_data_with_ai(file_path, filename):
                 text_buffer += f"--- Sheet: {sheet_name} ---\n"
                 text_buffer += df.fillna("").to_csv(index=False)
                 text_buffer += "\n\n"
-            
             if len(text_buffer) > 30000:
                 text_buffer = text_buffer[:30000]
 
@@ -217,22 +184,15 @@ def extract_data_with_ai(file_path, filename):
                 model = genai.GenerativeModel('gemini-flash-latest')
                 response = model.generate_content([STRICT_PROMPT, text_buffer], generation_config={"response_mime_type": "application/json"})
 
-            # クリーニング
             json_str = clean_json_response(response.text)
             ai_data_list = json.loads(json_str)
-            
             for item in ai_data_list:
                 item['ファイル名'] = filename
                 if "⑩全処理委託量_ton" not in item: item["⑩全処理委託量_ton"] = 0
-            
             return ai_data_list
-
         except Exception:
             return []
 
-    # ------------------------------------------------
-    # 2. PDFの場合 (.pdf)
-    # ------------------------------------------------
     elif file_ext == ".pdf":
         try:
             try:
@@ -241,21 +201,15 @@ def extract_data_with_ai(file_path, filename):
                 model = genai.GenerativeModel('gemini-flash-latest')
 
             sample_file = genai.upload_file(path=file_path, display_name=filename)
-            
-            # 画像PDF対策：600秒(10分)待機
             timeout_counter = 0
             while sample_file.state.name == "PROCESSING":
                 time.sleep(1)
                 timeout_counter += 1
                 sample_file = genai.get_file(sample_file.name)
-                
-                if timeout_counter > 600: 
-                    return [] 
+                if timeout_counter > 600: return [] 
             
-            if sample_file.state.name == "FAILED": 
-                return []
+            if sample_file.state.name == "FAILED": return []
             
-            # リトライ機構
             try:
                 response = model.generate_content([sample_file, STRICT_PROMPT], generation_config={"response_mime_type": "application/json"})
             except:
@@ -264,14 +218,11 @@ def extract_data_with_ai(file_path, filename):
             
             json_str = clean_json_response(response.text)
             data_list = json.loads(json_str)
-            
             for item in data_list:
                 item['ファイル名'] = filename
             return data_list
-
         except Exception:
             return []
-    
     else:
         return []
 
@@ -288,45 +239,38 @@ def convert_df_to_excel(df):
 tab1, tab2 = st.tabs(["📂 ファイルアップロード分析", "🌐 URLから自動収集"])
 
 # ------------------------------------------
-# タブ1：手動アップロード機能
+# タブ1：手動アップロード
 # ------------------------------------------
 with tab1:
     st.subheader("手持ちのファイルを分析")
     st.write("PDF または Excelファイル(.xlsx, .xls) をドラッグ＆ドロップしてください。")
-    
     uploaded_files = st.file_uploader("ファイルを選択", type=["pdf", "xlsx", "xls"], accept_multiple_files=True)
-    
     if uploaded_files:
         st.info(f"{len(uploaded_files)} 件のファイルが選択されています。")
-        
         if st.button("🚀 アップロードしたファイルを分析開始", type="primary"):
             if not api_key:
                 st.error("APIキーを設定してください")
             else:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                
                 with tempfile.TemporaryDirectory() as temp_dir:
                     save_dir = os.path.join(temp_dir, "uploads")
                     os.makedirs(save_dir, exist_ok=True)
-                    
                     batch_data = []
                     status_text.text("AIによる分析を開始します...")
-                    
                     for i, uploaded_file in enumerate(uploaded_files):
                         file_path = os.path.join(save_dir, uploaded_file.name)
                         with open(file_path, "wb") as f:
                             f.write(uploaded_file.getbuffer())
-                        
                         status_text.text(f"分析中 ({i+1}/{len(uploaded_files)}): {uploaded_file.name}")
                         extracted = extract_data_with_ai(file_path, uploaded_file.name)
                         if extracted:
                             batch_data.extend(extracted)
-                        
                         progress_bar.progress((i + 1) / len(uploaded_files))
                     
                     if batch_data:
                         df = pd.DataFrame(batch_data)
+                        # 列の整理
                         column_mapping = {
                             'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
                             '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
@@ -344,21 +288,16 @@ with tab1:
                         
                         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         st.session_state['history'].append({
-                            "time": now,
-                            "keyword": "手動アップロード",
-                            "count": len(df),
-                            "df": df
+                            "time": now, "keyword": "手動アップロード", "count": len(df), "df": df
                         })
-                        
-                        st.success(f"🎉 分析完了！ {len(df)} 件のデータを抽出しました。下の履歴からダウンロードできます。")
+                        st.success(f"🎉 分析完了！ {len(df)} 件のデータを抽出しました。")
                         time.sleep(1)
                     else:
                         st.warning("データが抽出できませんでした。")
-                    
                     gc.collect()
 
 # ------------------------------------------
-# タブ2：URL自動収集機能
+# タブ2：URL自動収集 & 監査
 # ------------------------------------------
 with tab2:
     st.subheader("Webサイトから自動収集")
@@ -402,6 +341,9 @@ with tab2:
 
     if target_url:
         all_file_links = get_file_links(target_url, keyword)
+        # セッションステートに全ファイルリストを保存（監査用）
+        st.session_state['all_target_files'] = [f[0] for f in all_file_links]
+
         processed_set = st.session_state['processed_urls']
         unprocessed_links = [link for link in all_file_links if link[1] not in processed_set]
         remaining_count = len(unprocessed_links)
@@ -449,6 +391,7 @@ with tab2:
                         
                         if batch_data:
                             df = pd.DataFrame(batch_data)
+                            # 列整理
                             column_mapping = {
                                 'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
                                 '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
@@ -471,7 +414,6 @@ with tab2:
                 
                 del downloaded_files
                 gc.collect()
-                # リスト更新
                 unprocessed_links = [link for link in all_file_links if link[1] not in st.session_state['processed_urls']]
                 remaining_count = len(unprocessed_links)
                 
@@ -486,7 +428,7 @@ with tab2:
                 st.session_state['is_running'] = False
                 st.rerun()
 
-# --- 共通：実行履歴エリア ---
+# --- 共通：実行履歴 & 監査レポートエリア ---
 st.markdown("---")
 st.subheader("📂 実行履歴 & 統合ダウンロード")
 
@@ -494,6 +436,63 @@ if len(st.session_state['history']) > 0:
     all_dfs = [item['df'] for item in st.session_state['history']]
     merged_df = pd.concat(all_dfs, ignore_index=True)
     
+    # -----------------------------------------------------
+    # 【新機能】網羅性監査レポート（Gap Analysis）
+    # -----------------------------------------------------
+    st.subheader("📊 取得状況の監査レポート")
+    
+    if st.session_state['all_target_files']:
+        # 1. Web上の全ファイルリスト
+        all_targets = set(st.session_state['all_target_files'])
+        # 2. 抽出できたファイルリスト（ユニーク）
+        extracted_files = set(merged_df['ファイル名'].unique())
+        
+        # 3. 照合
+        audit_data = []
+        for fname in sorted(list(all_targets)):
+            if fname in extracted_files:
+                # 抽出件数をカウント
+                row_count = len(merged_df[merged_df['ファイル名'] == fname])
+                status = "✅ 成功"
+                note = ""
+            else:
+                row_count = 0
+                status = "⚠️ 未取得"
+                note = "要確認"
+            
+            audit_data.append({
+                "ファイル名": fname,
+                "ステータス": status,
+                "抽出行数": row_count,
+                "備考": note
+            })
+        
+        audit_df = pd.DataFrame(audit_data)
+        
+        # 統計
+        success_count = len(audit_df[audit_df['ステータス'] == "✅ 成功"])
+        fail_count = len(audit_df[audit_df['ステータス'] == "⚠️ 未取得"])
+        
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.metric("取得成功ファイル", f"{success_count} / {len(all_targets)}")
+        with col_m2:
+            st.metric("未取得（要確認）", f"{fail_count} 件", delta=-fail_count)
+            
+        # 未取得がある場合だけ強調表示
+        if fail_count > 0:
+            st.error(f"注意: {fail_count} 件のファイルからデータが取れていません。リストを確認してください。")
+        else:
+            st.success("素晴らしい！すべての対象ファイルからデータを取得しました。")
+            
+        # テーブル表示（ステータスでソートして未取得を上に）
+        audit_df_sorted = audit_df.sort_values(by="ステータス", ascending=True) # ⚠️(U+26A0) < ✅(U+2705)
+        st.dataframe(audit_df_sorted, use_container_width=True)
+        
+    else:
+        st.info("Web自動収集を実行すると、ここに監査レポートが表示されます。")
+
+    st.markdown("---")
     st.info(f"💡 現在合計 **{len(merged_df)} 行** のデータがあります。")
     
     merged_excel = convert_df_to_excel(merged_df)
