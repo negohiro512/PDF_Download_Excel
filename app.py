@@ -18,8 +18,8 @@ st.set_page_config(page_title="産廃報告書AI抽出アプリ", layout="wide")
 
 st.title("📄 産廃報告書データ抽出・台帳作成アプリ")
 st.markdown("""
-**「Web自動収集」** または **「手動アップロード」** で、報告書データを抽出して一覧化します。
-**PDFファイル** と **Excelファイル** の両方に対応しています。
+**「Web自動収集」**、**「手動アップロード」**、または **「既存データの監査・補完」** を行います。
+画像PDFやExcelの取りこぼしを防ぎ、完全な台帳を作成します。
 """)
 
 # --- セッションステート初期化 ---
@@ -29,7 +29,6 @@ if 'processed_urls' not in st.session_state:
     st.session_state['processed_urls'] = set()
 if 'is_running' not in st.session_state:
     st.session_state['is_running'] = False
-# 監査用：Web上の全ファイルリストを保持（順序保持リスト）
 if 'all_target_files' not in st.session_state:
     st.session_state['all_target_files'] = []
 
@@ -59,13 +58,10 @@ with st.sidebar:
 # ロジック関数群
 # ==========================================
 
-# --- ヘルパー：日本時間取得 ---
 def get_jst_now_str():
-    """現在時刻を日本時間(JST)の文字列で返す"""
     jst = datetime.timezone(datetime.timedelta(hours=9))
     return datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
 
-# --- ヘルパー：JSONクリーニング関数 ---
 def clean_json_response(text):
     text = text.strip()
     if text.startswith("```json"):
@@ -80,7 +76,7 @@ def clean_json_response(text):
         return match.group(0)
     return text
 
-# --- Excel強力読み取り関数 (Pythonロジック) ---
+# --- Excel強力読み取り関数 ---
 def read_excel_robust(file_path):
     extracted_data = []
     try:
@@ -130,11 +126,10 @@ def read_excel_robust(file_path):
         return []
     return extracted_data
 
-# --- 共通関数：データ抽出（ハイブリッド・完全版） ---
+# --- データ抽出関数（ハイブリッド・完全版） ---
 def extract_data_with_ai(file_path, filename):
     file_ext = os.path.splitext(filename)[1].lower()
     
-    # 【修正】備考欄の「AI抽出」を削除し、空欄にする例に変更
     STRICT_PROMPT = """
     あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
     
@@ -183,14 +178,12 @@ def extract_data_with_ai(file_path, filename):
                 text_buffer += "\n\n"
             if len(text_buffer) > 30000:
                 text_buffer = text_buffer[:30000]
-
             try:
                 model = genai.GenerativeModel('gemini-2.5-flash')
                 response = model.generate_content([STRICT_PROMPT, text_buffer], generation_config={"response_mime_type": "application/json"})
             except:
                 model = genai.GenerativeModel('gemini-flash-latest')
                 response = model.generate_content([STRICT_PROMPT, text_buffer], generation_config={"response_mime_type": "application/json"})
-
             json_str = clean_json_response(response.text)
             ai_data_list = json.loads(json_str)
             for item in ai_data_list:
@@ -213,6 +206,7 @@ def extract_data_with_ai(file_path, filename):
                 time.sleep(1)
                 timeout_counter += 1
                 sample_file = genai.get_file(sample_file.name)
+                # 画像PDF対策：10分待機
                 if timeout_counter > 600: return [] 
             
             if sample_file.state.name == "FAILED": return []
@@ -240,10 +234,42 @@ def convert_df_to_excel(df):
             data = f.read()
     return data
 
+def get_file_links_ordered(target_url, keyword):
+    """URLからファイルリンクを出現順に取得"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        response = requests.get(target_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        response.encoding = response.apparent_encoding
+        soup = BeautifulSoup(response.content, "html.parser")
+        links = soup.find_all("a")
+        
+        target_urls = []
+        seen_urls = set()
+        
+        for link in links:
+            href = link.get("href")
+            if href:
+                href_lower = href.lower()
+                if href_lower.endswith(".pdf") or href_lower.endswith(".xlsx") or href_lower.endswith(".xls"):
+                    full_url = urllib.parse.urljoin(target_url, href)
+                    filename = os.path.basename(urllib.parse.urlparse(full_url).path)
+                    try: filename = urllib.parse.unquote(filename)
+                    except: pass
+                    
+                    if not keyword or keyword in filename:
+                        if full_url not in seen_urls:
+                            target_urls.append((filename, full_url))
+                            seen_urls.add(full_url)
+        return target_urls
+    except Exception as e:
+        st.error(f"リンク取得エラー: {e}")
+        return []
+
 # ==========================================
 # タブで機能を切り替え
 # ==========================================
-tab1, tab2 = st.tabs(["📂 ファイルアップロード分析", "🌐 URLから自動収集"])
+tab1, tab2, tab3 = st.tabs(["📂 ファイルアップロード分析", "🌐 URLから自動収集", "🔍 既存データの監査・補完"])
 
 # ------------------------------------------
 # タブ1：手動アップロード
@@ -277,7 +303,6 @@ with tab1:
                     
                     if batch_data:
                         df = pd.DataFrame(batch_data)
-                        # 列の整理
                         column_mapping = {
                             'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
                             '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
@@ -293,7 +318,6 @@ with tab1:
                         target_cols = [c for c in column_mapping.keys() if c in df.columns]
                         df = df[target_cols].rename(columns=column_mapping)
                         
-                        # 【修正】日本時間を使用
                         now = get_jst_now_str()
                         st.session_state['history'].append({
                             "time": now, "keyword": "手動アップロード", "count": len(df), "df": df
@@ -320,43 +344,8 @@ with tab2:
 
     batch_size = st.number_input("自動処理のバッチサイズ", min_value=1, value=50, step=10)
 
-    # 【修正】リンク取得関数（出現順を保持）
-    def get_file_links(target_url, keyword):
-        headers = {"User-Agent": "Mozilla/5.0"}
-        try:
-            response = requests.get(target_url, headers=headers, timeout=15)
-            response.raise_for_status()
-            response.encoding = response.apparent_encoding
-            soup = BeautifulSoup(response.content, "html.parser")
-            links = soup.find_all("a")
-            
-            target_urls = []
-            seen_urls = set() # 重複防止用セット
-            
-            for link in links:
-                href = link.get("href")
-                if href:
-                    href_lower = href.lower()
-                    if href_lower.endswith(".pdf") or href_lower.endswith(".xlsx") or href_lower.endswith(".xls"):
-                        full_url = urllib.parse.urljoin(target_url, href)
-                        filename = os.path.basename(urllib.parse.urlparse(full_url).path)
-                        try: filename = urllib.parse.unquote(filename)
-                        except: pass
-                        
-                        if not keyword or keyword in filename:
-                            # 順序を保持しつつ重複排除
-                            if full_url not in seen_urls:
-                                target_urls.append((filename, full_url))
-                                seen_urls.add(full_url)
-                                
-            return target_urls
-        except Exception as e:
-            st.error(f"エラー: {e}")
-            return []
-
     if target_url:
-        all_file_links = get_file_links(target_url, keyword)
-        # セッションステートに全ファイルリストを保存（順序保持）
+        all_file_links = get_file_links_ordered(target_url, keyword)
         st.session_state['all_target_files'] = [f[0] for f in all_file_links]
 
         processed_set = st.session_state['processed_urls']
@@ -406,7 +395,6 @@ with tab2:
                         
                         if batch_data:
                             df = pd.DataFrame(batch_data)
-                            # 列整理
                             column_mapping = {
                                 'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
                                 '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
@@ -422,7 +410,6 @@ with tab2:
                             target_cols = [c for c in column_mapping.keys() if c in df.columns]
                             df = df[target_cols].rename(columns=column_mapping)
                             
-                            # 【修正】日本時間を使用
                             now = get_jst_now_str()
                             st.session_state['history'].append({
                                 "time": now, "keyword": keyword, "count": len(df), "df": df
@@ -444,7 +431,126 @@ with tab2:
                 st.session_state['is_running'] = False
                 st.rerun()
 
-# --- 共通：実行履歴 & 監査レポートエリア ---
+# ------------------------------------------
+# タブ3：既存データの監査・補完 (New!)
+# ------------------------------------------
+with tab3:
+    st.subheader("🔍 既存データの監査・補完")
+    st.markdown("""
+    1. 手元にある「既存のExcelファイル」をアップロードしてください。
+    2. 下のURLにあるファイルリストと照合し、**「不足しているファイル（取りこぼし）」**を特定します。
+    3. 不足分だけをピンポイントで自動収集し、データを補完します。
+    """)
+    
+    # 1. Excelアップロード
+    existing_excel = st.file_uploader("既存の集計Excelファイル (.xlsx)", type=["xlsx"])
+    
+    # 2. URL入力
+    check_url = st.text_input("照合先のWebサイトURL", "https://www.pref.tokushima.lg.jp/jigyoshanokata/kurashi/recycling/7300999", key="audit_url")
+    check_keyword = st.text_input("ファイル名フィルタ", "", key="audit_keyword")
+
+    if existing_excel and check_url:
+        if st.button("🔎 監査を実行（差分チェック）"):
+            try:
+                # Excelからファイル名リストを取得
+                df_existing = pd.read_excel(existing_excel)
+                if 'ファイル名' not in df_existing.columns:
+                    st.error("エラー: アップロードされたExcelに「ファイル名」という列が見つかりません。")
+                else:
+                    existing_files = set(df_existing['ファイル名'].unique())
+                    st.info(f"📄 アップロードされたデータ: **{len(existing_files)} ファイル** 分の記録があります。")
+                    
+                    # Webから最新リストを取得
+                    with st.spinner("Webサイトのファイルリストを取得中..."):
+                        web_links = get_file_links_ordered(check_url, check_keyword)
+                    
+                    web_files_map = {f[0]: f[1] for f in web_links} # fname -> url
+                    web_files_list = [f[0] for f in web_links] # order preserved
+                    
+                    st.info(f"🌐 Webサイト上の対象ファイル: **{len(web_files_list)} ファイル** 見つかりました。")
+                    
+                    # 差分抽出
+                    missing_files = []
+                    for fname in web_files_list:
+                        if fname not in existing_files:
+                            missing_files.append(fname)
+                    
+                    if len(missing_files) == 0:
+                        st.success("✅ 完璧です！ Web上のファイルはすべてExcelに含まれています。不足はありません。")
+                    else:
+                        st.error(f"⚠️ **{len(missing_files)} 件** のファイルが不足しています（取りこぼし）。")
+                        st.write("### 不足ファイルリスト")
+                        st.dataframe(pd.DataFrame(missing_files, columns=["不足ファイル名"]), use_container_width=True)
+                        
+                        # 救済用データをセッションに保存
+                        st.session_state['missing_targets'] = [(f, web_files_map[f]) for f in missing_files]
+                        
+            except Exception as e:
+                st.error(f"読み込みエラー: {e}")
+
+    # 3. 救済実行ボタン
+    if 'missing_targets' in st.session_state and len(st.session_state['missing_targets']) > 0:
+        st.markdown("---")
+        st.subheader("🚑 不足データの救済")
+        st.write("上記で検出された不足ファイルのみをダウンロードして解析します。")
+        
+        if st.button("🚀 不足分を自動収集する", type="primary"):
+            missing_targets = st.session_state['missing_targets']
+            progress_bar = st.progress(0)
+            status_box = st.empty()
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                save_dir = os.path.join(temp_dir, "rescue")
+                os.makedirs(save_dir, exist_ok=True)
+                
+                batch_data = []
+                headers = {"User-Agent": "Mozilla/5.0"}
+                
+                for i, (fname, furl) in enumerate(missing_targets):
+                    status_box.text(f"救出中 ({i+1}/{len(missing_targets)}): {fname}")
+                    try:
+                        res = requests.get(furl, headers=headers, timeout=15)
+                        fpath = os.path.join(save_dir, fname)
+                        with open(fpath, "wb") as f: f.write(res.content)
+                        
+                        extracted = extract_data_with_ai(fpath, fname)
+                        if extracted:
+                            batch_data.extend(extracted)
+                    except Exception as e:
+                        st.write(f"エラー: {fname} -> {e}")
+                    
+                    progress_bar.progress((i + 1) / len(missing_targets))
+                
+                if batch_data:
+                    df = pd.DataFrame(batch_data)
+                    # カラム整理
+                    column_mapping = {
+                            'ファイル名': 'ファイル名', '自治体名': '自治体名', '提出日': '提出日',
+                            '対象年度': '対象年度', '文書種類': '種類', '事業の種類': '事業の種類',
+                            '排出事業者名': '排出事業者名', '事業場名': '事業場名', '住所': '住所',
+                            '廃棄物の種類': '廃棄物の種類',
+                            '⑩全処理委託量_ton': '⑩全処理委託量(t)',
+                            '⑪優良認定処理業者への処理委託量_ton': '⑪優良認定(t)',
+                            '⑫再生利用業者への処理委託量_ton': '⑫再生利用(t)',
+                            '⑬熱回収認定業者への処理委託量_ton': '⑬熱回収認定(t)',
+                            '⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton': '⑭熱回収その他(t)',
+                            '備考': '備考'
+                    }
+                    target_cols = [c for c in column_mapping.keys() if c in df.columns]
+                    df = df[target_cols].rename(columns=column_mapping)
+                    
+                    now = get_jst_now_str()
+                    st.session_state['history'].append({
+                        "time": now, "keyword": "不足分救出", "count": len(df), "df": df
+                    })
+                    st.success(f"🎉 救出完了！ {len(df)} 行のデータを追加しました。履歴から統合データをダウンロードしてください。")
+                    # クリア
+                    del st.session_state['missing_targets']
+                else:
+                    st.warning("救出を試みましたが、データが抽出できませんでした。")
+
+
+# --- 共通：実行履歴 & 統合ダウンロード ---
 st.markdown("---")
 st.subheader("📂 実行履歴 & 統合ダウンロード")
 
@@ -453,41 +559,30 @@ if len(st.session_state['history']) > 0:
     merged_df = pd.concat(all_dfs, ignore_index=True)
     
     # -----------------------------------------------------
-    # 【機能修正】取得状況のレポート（Gap Analysis）
+    # 取得状況のレポート（Gap Analysis）
     # -----------------------------------------------------
     st.subheader("📊 取得状況のレポート")
     
     if st.session_state['all_target_files']:
-        # 1. Web上の全ファイルリスト（保存された出現順リストを使用）
-        # ※ setを使わず、リストの順序をそのまま使う
         all_targets_ordered = st.session_state['all_target_files']
-        
-        # 2. 抽出できたファイルリスト（ユニーク）
         extracted_files = set(merged_df['ファイル名'].unique())
         
-        # 3. 照合
         audit_data = []
-        # ここで出現順にループさせることで、レポートの並び順を保証する
         for fname in all_targets_ordered:
             if fname in extracted_files:
                 row_count = len(merged_df[merged_df['ファイル名'] == fname])
                 status = "✅ 成功"
-                note = ""
             else:
                 row_count = 0
                 status = "⚠️ 未取得"
-                note = "要確認"
             
             audit_data.append({
                 "ファイル名": fname,
                 "ステータス": status,
-                "抽出行数": row_count,
-                "備考": note
+                "抽出行数": row_count
             })
         
         audit_df = pd.DataFrame(audit_data)
-        
-        # 統計
         success_count = len(audit_df[audit_df['ステータス'] == "✅ 成功"])
         fail_count = len(audit_df[audit_df['ステータス'] == "⚠️ 未取得"])
         
@@ -497,16 +592,7 @@ if len(st.session_state['history']) > 0:
         with col_m2:
             st.metric("未取得（要確認）", f"{fail_count} 件", delta=-fail_count)
             
-        if fail_count > 0:
-            st.error(f"注意: {fail_count} 件のファイルからデータが取れていません。リストを確認してください。")
-        else:
-            st.success("素晴らしい！すべての対象ファイルからデータを取得しました。")
-            
-        # テーブル表示（ソートせずにそのまま表示＝出現順）
         st.dataframe(audit_df, use_container_width=True)
-        
-    else:
-        st.info("Web自動収集を実行すると、ここにレポートが表示されます。")
 
     st.markdown("---")
     st.info(f"💡 現在合計 **{len(merged_df)} 行** のデータがあります。")
