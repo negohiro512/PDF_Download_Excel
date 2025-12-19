@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 import datetime
 import gc  # メモリ解放用
+import re   # JSONクリーニング用
 
 # --- 画面設定 ---
 st.set_page_config(page_title="産廃報告書AI抽出アプリ", layout="wide")
@@ -51,8 +52,29 @@ with st.sidebar:
     st.info("※APIキーがない場合、動作しません。")
 
 # ==========================================
-# ロジック関数群（本番用・ログ非表示版）
+# ロジック関数群
 # ==========================================
+
+# --- ヘルパー：JSONクリーニング関数 ---
+def clean_json_response(text):
+    """AIが返すMarkdown記法や余計な文字を削除してJSON部分だけ取り出す"""
+    text = text.strip()
+    # ```json ... ``` の削除
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+    
+    # 前後の余白削除
+    text = text.strip()
+    
+    # JSONの配列 [...] を探す
+    match = re.search(r'\[.*\]', text, re.DOTALL)
+    if match:
+        return match.group(0)
+    return text
 
 # --- Excel強力読み取り関数 (Pythonロジック) ---
 def read_excel_robust(file_path):
@@ -127,15 +149,46 @@ def read_excel_robust(file_path):
     return extracted_data
 
 
-# --- 共通関数：データ抽出（ハイブリッド版・修正済み） ---
+# --- 共通関数：データ抽出（ハイブリッド・完全版） ---
 def extract_data_with_ai(file_path, filename):
     file_ext = os.path.splitext(filename)[1].lower()
     
+    # 共通プロンプト：キー名を厳格に定義
+    STRICT_PROMPT = """
+    あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
+    
+    【重要規則】
+    1. 出力は必ず **以下のJSONフォーマット** に従ってください。キー名は絶対に変更しないでください。
+    2. 「実績」の数値を抽出してください。「計画」や「目標」のみの場合は、それを抽出して備考に「計画値」と明記してください。
+    3. Markdown記法（```json）は含めないでください。
+
+    【JSON出力例】
+    [
+      {
+        "提出日": "令和6年6月30日",
+        "対象年度": "令和5年度",
+        "文書種類": "報告書",
+        "排出事業者名": "有限会社〇〇",
+        "事業の種類": "建設業",
+        "事業場名": "〇〇工事現場",
+        "住所": "徳島県...",
+        "自治体名": "徳島県",
+        "廃棄物の種類": "汚泥",
+        "⑩全処理委託量_ton": 100.5,
+        "⑪優良認定処理業者への処理委託量_ton": 0,
+        "⑫再生利用業者への処理委託量_ton": 100.5,
+        "⑬熱回収認定業者への処理委託量_ton": 0,
+        "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
+        "備考": "AI抽出"
+      }
+    ]
+    """
+
     # ------------------------------------------------
     # 1. Excelの場合 (.xlsx, .xls)
     # ------------------------------------------------
     if file_ext in [".xlsx", ".xls"]:
-        # 【STEP 1】Pythonロジックで試行
+        # 【STEP 1】Pythonロジック
         data_list = read_excel_robust(file_path)
         
         if len(data_list) > 0:
@@ -145,7 +198,7 @@ def extract_data_with_ai(file_path, filename):
                     item["排出事業者名"] = filename
             return data_list
         
-        # 【STEP 2】0件ならAI救済モード
+        # 【STEP 2】AI救済モード
         try:
             xls = pd.read_excel(file_path, sheet_name=None)
             text_buffer = f"ファイル名: {filename}\n\n"
@@ -157,37 +210,16 @@ def extract_data_with_ai(file_path, filename):
             if len(text_buffer) > 30000:
                 text_buffer = text_buffer[:30000]
 
-            # 【修正点】プロンプトにJSON例を復活させ、確実にJSON化させる
-            prompt_text = """
-            あなたはデータ入力の専門家です。Excelデータから産業廃棄物処理報告書の情報を抽出してください。
-            表形式のデータから、「廃棄物の種類」と「全処理委託量(実績)」のペアを全て抜き出してください。
-            合計行は無視してください。
-
-            【重要】出力は以下のJSON形式のリストのみを行ってください。Markdown記法（```jsonなど）は不要です。
-            [
-              {
-                "廃棄物の種類": "汚泥",
-                "⑩全処理委託量_ton": 123.4,
-                "備考": "AI抽出"
-              }
-            ]
-            """
-            
             try:
                 model = genai.GenerativeModel('gemini-2.5-flash')
-                response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
+                response = model.generate_content([STRICT_PROMPT, text_buffer], generation_config={"response_mime_type": "application/json"})
             except:
                 model = genai.GenerativeModel('gemini-flash-latest')
-                response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
+                response = model.generate_content([STRICT_PROMPT, text_buffer], generation_config={"response_mime_type": "application/json"})
 
-            # レスポンスのクリーニング（万が一 ```json がついても取る）
-            clean_text = response.text.strip()
-            if clean_text.startswith("```json"):
-                clean_text = clean_text[7:]
-            if clean_text.endswith("```"):
-                clean_text = clean_text[:-3]
-
-            ai_data_list = json.loads(clean_text)
+            # クリーニング
+            json_str = clean_json_response(response.text)
+            ai_data_list = json.loads(json_str)
             
             for item in ai_data_list:
                 item['ファイル名'] = filename
@@ -195,8 +227,7 @@ def extract_data_with_ai(file_path, filename):
             
             return ai_data_list
 
-        except Exception as e:
-            # エラー時は空リスト
+        except Exception:
             return []
 
     # ------------------------------------------------
@@ -211,7 +242,7 @@ def extract_data_with_ai(file_path, filename):
 
             sample_file = genai.upload_file(path=file_path, display_name=filename)
             
-            # 画像PDF対策：待ち時間を600秒(10分)に設定
+            # 画像PDF対策：600秒(10分)待機
             timeout_counter = 0
             while sample_file.state.name == "PROCESSING":
                 time.sleep(1)
@@ -224,25 +255,15 @@ def extract_data_with_ai(file_path, filename):
             if sample_file.state.name == "FAILED": 
                 return []
             
-            prompt_text = """
-            あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
-            必ず「①現状（実績）」の数値のみを抽出し、「②計画」は無視してください。
-            
-            【出力項目】
-            提出日, 対象年度, 文書種類(報告書), 排出事業者名, 事業の種類, 事業場名, 住所, 
-            廃棄物の種類, ⑩全処理委託量_ton, ⑪優良認定(t), ⑫再生利用(t), ⑬熱回収認定(t), ⑭熱回収その他(t), 自治体名
-
-            【出力フォーマット】
-            JSON形式のリストのみ。
-            """
-
+            # リトライ機構
             try:
-                response = model.generate_content([sample_file, prompt_text], generation_config={"response_mime_type": "application/json"})
+                response = model.generate_content([sample_file, STRICT_PROMPT], generation_config={"response_mime_type": "application/json"})
             except:
                 time.sleep(2)
-                response = model.generate_content([sample_file, prompt_text], generation_config={"response_mime_type": "application/json"})
+                response = model.generate_content([sample_file, STRICT_PROMPT], generation_config={"response_mime_type": "application/json"})
             
-            data_list = json.loads(response.text)
+            json_str = clean_json_response(response.text)
+            data_list = json.loads(json_str)
             
             for item in data_list:
                 item['ファイル名'] = filename
