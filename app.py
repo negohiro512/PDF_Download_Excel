@@ -127,7 +127,7 @@ def read_excel_robust(file_path):
     return extracted_data
 
 
-# --- 共通関数：データ抽出（ハイブリッド版） ---
+# --- 共通関数：データ抽出（ハイブリッド版・修正済み） ---
 def extract_data_with_ai(file_path, filename):
     file_ext = os.path.splitext(filename)[1].lower()
     
@@ -154,15 +154,23 @@ def extract_data_with_ai(file_path, filename):
                 text_buffer += df.fillna("").to_csv(index=False)
                 text_buffer += "\n\n"
             
-            # トークン節約のためトリミング
             if len(text_buffer) > 30000:
                 text_buffer = text_buffer[:30000]
 
+            # 【修正点】プロンプトにJSON例を復活させ、確実にJSON化させる
             prompt_text = """
             あなたはデータ入力の専門家です。Excelデータから産業廃棄物処理報告書の情報を抽出してください。
             表形式のデータから、「廃棄物の種類」と「全処理委託量(実績)」のペアを全て抜き出してください。
             合計行は無視してください。
-            出力はJSON形式のリストのみ。
+
+            【重要】出力は以下のJSON形式のリストのみを行ってください。Markdown記法（```jsonなど）は不要です。
+            [
+              {
+                "廃棄物の種類": "汚泥",
+                "⑩全処理委託量_ton": 123.4,
+                "備考": "AI抽出"
+              }
+            ]
             """
             
             try:
@@ -172,7 +180,14 @@ def extract_data_with_ai(file_path, filename):
                 model = genai.GenerativeModel('gemini-flash-latest')
                 response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
 
-            ai_data_list = json.loads(response.text)
+            # レスポンスのクリーニング（万が一 ```json がついても取る）
+            clean_text = response.text.strip()
+            if clean_text.startswith("```json"):
+                clean_text = clean_text[7:]
+            if clean_text.endswith("```"):
+                clean_text = clean_text[:-3]
+
+            ai_data_list = json.loads(clean_text)
             
             for item in ai_data_list:
                 item['ファイル名'] = filename
@@ -180,7 +195,8 @@ def extract_data_with_ai(file_path, filename):
             
             return ai_data_list
 
-        except Exception:
+        except Exception as e:
+            # エラー時は空リスト
             return []
 
     # ------------------------------------------------
@@ -195,7 +211,7 @@ def extract_data_with_ai(file_path, filename):
 
             sample_file = genai.upload_file(path=file_path, display_name=filename)
             
-            # 【重要】画像PDF対策：待ち時間を600秒(10分)に設定
+            # 画像PDF対策：待ち時間を600秒(10分)に設定
             timeout_counter = 0
             while sample_file.state.name == "PROCESSING":
                 time.sleep(1)
@@ -203,7 +219,7 @@ def extract_data_with_ai(file_path, filename):
                 sample_file = genai.get_file(sample_file.name)
                 
                 if timeout_counter > 600: 
-                    return [] # タイムアウト
+                    return [] 
             
             if sample_file.state.name == "FAILED": 
                 return []
