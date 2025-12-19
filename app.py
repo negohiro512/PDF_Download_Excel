@@ -29,7 +29,7 @@ if 'processed_urls' not in st.session_state:
     st.session_state['processed_urls'] = set()
 if 'is_running' not in st.session_state:
     st.session_state['is_running'] = False
-# 監査用：Web上の全ファイルリストを保持
+# 監査用：Web上の全ファイルリストを保持（順序保持リスト）
 if 'all_target_files' not in st.session_state:
     st.session_state['all_target_files'] = []
 
@@ -58,6 +58,12 @@ with st.sidebar:
 # ==========================================
 # ロジック関数群
 # ==========================================
+
+# --- ヘルパー：日本時間取得 ---
+def get_jst_now_str():
+    """現在時刻を日本時間(JST)の文字列で返す"""
+    jst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.now(jst).strftime("%Y-%m-%d %H:%M:%S")
 
 # --- ヘルパー：JSONクリーニング関数 ---
 def clean_json_response(text):
@@ -116,7 +122,7 @@ def read_excel_robust(file_path):
                             extracted_data.append({
                                 "提出日": "", "対象年度": "", "文書種類": "報告書", "排出事業者名": "",
                                 "事業の種類": "", "事業場名": "", "住所": "", "自治体名": "",
-                                "廃棄物の種類": waste_type, "⑩全処理委託量_ton": amt, "備考": f"Sheet: {sheet_name}"
+                                "廃棄物の種類": waste_type, "⑩全処理委託量_ton": amt, "備考": ""
                             })
                         except ValueError:
                             continue 
@@ -128,6 +134,7 @@ def read_excel_robust(file_path):
 def extract_data_with_ai(file_path, filename):
     file_ext = os.path.splitext(filename)[1].lower()
     
+    # 【修正】備考欄の「AI抽出」を削除し、空欄にする例に変更
     STRICT_PROMPT = """
     あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
     
@@ -153,7 +160,7 @@ def extract_data_with_ai(file_path, filename):
         "⑫再生利用業者への処理委託量_ton": 100.5,
         "⑬熱回収認定業者への処理委託量_ton": 0,
         "⑭熱回収認定業者以外の熱回収を行う業者への処理委託量_ton": 0,
-        "備考": "AI抽出"
+        "備考": ""
       }
     ]
     """
@@ -286,7 +293,8 @@ with tab1:
                         target_cols = [c for c in column_mapping.keys() if c in df.columns]
                         df = df[target_cols].rename(columns=column_mapping)
                         
-                        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        # 【修正】日本時間を使用
+                        now = get_jst_now_str()
                         st.session_state['history'].append({
                             "time": now, "keyword": "手動アップロード", "count": len(df), "df": df
                         })
@@ -297,7 +305,7 @@ with tab1:
                     gc.collect()
 
 # ------------------------------------------
-# タブ2：URL自動収集 & 監査
+# タブ2：URL自動収集 & レポート
 # ------------------------------------------
 with tab2:
     st.subheader("Webサイトから自動収集")
@@ -312,7 +320,7 @@ with tab2:
 
     batch_size = st.number_input("自動処理のバッチサイズ", min_value=1, value=50, step=10)
 
-    # リンク取得関数
+    # 【修正】リンク取得関数（出現順を保持）
     def get_file_links(target_url, keyword):
         headers = {"User-Agent": "Mozilla/5.0"}
         try:
@@ -321,7 +329,10 @@ with tab2:
             response.encoding = response.apparent_encoding
             soup = BeautifulSoup(response.content, "html.parser")
             links = soup.find_all("a")
+            
             target_urls = []
+            seen_urls = set() # 重複防止用セット
+            
             for link in links:
                 href = link.get("href")
                 if href:
@@ -333,15 +344,19 @@ with tab2:
                         except: pass
                         
                         if not keyword or keyword in filename:
-                            target_urls.append((filename, full_url))
-            return list(set(target_urls))
+                            # 順序を保持しつつ重複排除
+                            if full_url not in seen_urls:
+                                target_urls.append((filename, full_url))
+                                seen_urls.add(full_url)
+                                
+            return target_urls
         except Exception as e:
             st.error(f"エラー: {e}")
             return []
 
     if target_url:
         all_file_links = get_file_links(target_url, keyword)
-        # セッションステートに全ファイルリストを保存（監査用）
+        # セッションステートに全ファイルリストを保存（順序保持）
         st.session_state['all_target_files'] = [f[0] for f in all_file_links]
 
         processed_set = st.session_state['processed_urls']
@@ -407,7 +422,8 @@ with tab2:
                             target_cols = [c for c in column_mapping.keys() if c in df.columns]
                             df = df[target_cols].rename(columns=column_mapping)
                             
-                            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            # 【修正】日本時間を使用
+                            now = get_jst_now_str()
                             st.session_state['history'].append({
                                 "time": now, "keyword": keyword, "count": len(df), "df": df
                             })
@@ -437,21 +453,23 @@ if len(st.session_state['history']) > 0:
     merged_df = pd.concat(all_dfs, ignore_index=True)
     
     # -----------------------------------------------------
-    # 【新機能】網羅性監査レポート（Gap Analysis）
+    # 【機能修正】取得状況のレポート（Gap Analysis）
     # -----------------------------------------------------
-    st.subheader("📊 取得状況の監査レポート")
+    st.subheader("📊 取得状況のレポート")
     
     if st.session_state['all_target_files']:
-        # 1. Web上の全ファイルリスト
-        all_targets = set(st.session_state['all_target_files'])
+        # 1. Web上の全ファイルリスト（保存された出現順リストを使用）
+        # ※ setを使わず、リストの順序をそのまま使う
+        all_targets_ordered = st.session_state['all_target_files']
+        
         # 2. 抽出できたファイルリスト（ユニーク）
         extracted_files = set(merged_df['ファイル名'].unique())
         
         # 3. 照合
         audit_data = []
-        for fname in sorted(list(all_targets)):
+        # ここで出現順にループさせることで、レポートの並び順を保証する
+        for fname in all_targets_ordered:
             if fname in extracted_files:
-                # 抽出件数をカウント
                 row_count = len(merged_df[merged_df['ファイル名'] == fname])
                 status = "✅ 成功"
                 note = ""
@@ -475,22 +493,20 @@ if len(st.session_state['history']) > 0:
         
         col_m1, col_m2 = st.columns(2)
         with col_m1:
-            st.metric("取得成功ファイル", f"{success_count} / {len(all_targets)}")
+            st.metric("取得成功ファイル", f"{success_count} / {len(all_targets_ordered)}")
         with col_m2:
             st.metric("未取得（要確認）", f"{fail_count} 件", delta=-fail_count)
             
-        # 未取得がある場合だけ強調表示
         if fail_count > 0:
             st.error(f"注意: {fail_count} 件のファイルからデータが取れていません。リストを確認してください。")
         else:
             st.success("素晴らしい！すべての対象ファイルからデータを取得しました。")
             
-        # テーブル表示（ステータスでソートして未取得を上に）
-        audit_df_sorted = audit_df.sort_values(by="ステータス", ascending=True) # ⚠️(U+26A0) < ✅(U+2705)
-        st.dataframe(audit_df_sorted, use_container_width=True)
+        # テーブル表示（ソートせずにそのまま表示＝出現順）
+        st.dataframe(audit_df, use_container_width=True)
         
     else:
-        st.info("Web自動収集を実行すると、ここに監査レポートが表示されます。")
+        st.info("Web自動収集を実行すると、ここにレポートが表示されます。")
 
     st.markdown("---")
     st.info(f"💡 現在合計 **{len(merged_df)} 行** のデータがあります。")
