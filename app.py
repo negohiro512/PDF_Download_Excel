@@ -51,10 +51,10 @@ with st.sidebar:
     st.info("※APIキーがない場合、動作しません。")
 
 # ==========================================
-# デバッグ機能付き：ロジック関数群
+# ロジック関数群（本番用・ログ非表示版）
 # ==========================================
 
-# --- Excel強力読み取り関数 (エラー表示版) ---
+# --- Excel強力読み取り関数 (Pythonロジック) ---
 def read_excel_robust(file_path):
     extracted_data = []
     try:
@@ -64,9 +64,7 @@ def read_excel_robust(file_path):
             try:
                 # ヘッダーなしでシート全体を読み込む
                 df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
-            except Exception as e:
-                # ログに出す（読み込めないシートはスキップ）
-                st.write(f"⚠️ Sheet読込エラー: {sheet_name} -> {e}")
+            except Exception:
                 continue
             
             # --- キーワード探索 ---
@@ -98,7 +96,7 @@ def read_excel_robust(file_path):
                     
                     if pd.notna(kind_val) and pd.notna(amount_val):
                         try:
-                            # 数値変換できるものだけ取得（「合計」行などを除外）
+                            # 数値変換できるものだけ取得
                             amt_str = str(amount_val).replace(",", "").strip()
                             amt = float(amt_str)
                             waste_type = str(kind_val).strip()
@@ -123,144 +121,122 @@ def read_excel_robust(file_path):
                         except ValueError:
                             continue 
 
-    except Exception as e:
-        st.error(f"❌ Excelファイル自体の読込失敗: {e}")
+    except Exception:
         return []
         
     return extracted_data
 
 
-# --- 共通関数：データ抽出（ハイブリッド＆デバッグ表示版） ---
+# --- 共通関数：データ抽出（ハイブリッド版） ---
 def extract_data_with_ai(file_path, filename):
     file_ext = os.path.splitext(filename)[1].lower()
     
-    # ログ表示用のコンテナ（閉じておく）
-    with st.expander(f"🔍 解析ログ: {filename}", expanded=False):
+    # ------------------------------------------------
+    # 1. Excelの場合 (.xlsx, .xls)
+    # ------------------------------------------------
+    if file_ext in [".xlsx", ".xls"]:
+        # 【STEP 1】Pythonロジックで試行
+        data_list = read_excel_robust(file_path)
         
-        # ------------------------------------------------
-        # 1. Excelの場合
-        # ------------------------------------------------
-        if file_ext in [".xlsx", ".xls"]:
-            st.write("🔹 Python解析を実行中...")
-            data_list = read_excel_robust(file_path)
+        if len(data_list) > 0:
+            for item in data_list:
+                item['ファイル名'] = filename
+                if "排出事業者名" in item and not item["排出事業者名"]:
+                    item["排出事業者名"] = filename
+            return data_list
+        
+        # 【STEP 2】0件ならAI救済モード
+        try:
+            xls = pd.read_excel(file_path, sheet_name=None)
+            text_buffer = f"ファイル名: {filename}\n\n"
+            for sheet_name, df in xls.items():
+                text_buffer += f"--- Sheet: {sheet_name} ---\n"
+                text_buffer += df.fillna("").to_csv(index=False)
+                text_buffer += "\n\n"
             
-            if len(data_list) > 0:
-                st.success(f"✅ Pythonで {len(data_list)} 行抽出成功！")
-                for item in data_list:
-                    item['ファイル名'] = filename
-                    if "排出事業者名" in item and not item["排出事業者名"]:
-                        item["排出事業者名"] = filename
-                return data_list
-            
-            st.warning("🔸 Python抽出 0件 -> AI救済モードへ移行します")
+            # トークン節約のためトリミング
+            if len(text_buffer) > 30000:
+                text_buffer = text_buffer[:30000]
+
+            prompt_text = """
+            あなたはデータ入力の専門家です。Excelデータから産業廃棄物処理報告書の情報を抽出してください。
+            表形式のデータから、「廃棄物の種類」と「全処理委託量(実績)」のペアを全て抜き出してください。
+            合計行は無視してください。
+            出力はJSON形式のリストのみ。
+            """
             
             try:
-                # Excelテキスト化
-                xls = pd.read_excel(file_path, sheet_name=None)
-                text_buffer = f"ファイル名: {filename}\n\n"
-                for sheet_name, df in xls.items():
-                    text_buffer += f"--- Sheet: {sheet_name} ---\n"
-                    text_buffer += df.fillna("").to_csv(index=False)
-                    text_buffer += "\n\n"
-                
-                # 文字数が多すぎる場合のガード
-                if len(text_buffer) > 30000:
-                    st.write("⚠️ データ量が多いためトリミングして送信します")
-                    text_buffer = text_buffer[:30000]
+                model = genai.GenerativeModel('gemini-2.5-flash')
+                response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
+            except:
+                model = genai.GenerativeModel('gemini-flash-latest')
+                response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
 
-                prompt_text = """
-                あなたはデータ入力の専門家です。Excelデータから産業廃棄物処理報告書の情報を抽出してください。
-                表形式のデータから、「廃棄物の種類」と「全処理委託量(実績)」のペアを全て抜き出してください。
-                合計行は無視してください。
-                出力はJSON形式のリストのみ。
-                [{"廃棄物の種類": "xx", "⑩全処理委託量_ton": 10.5, "備考": "AI抽出"}]
-                """
-                
-                st.write("🔹 Gemini API 呼び出し中...")
-                try:
-                    model = genai.GenerativeModel('gemini-2.5-flash')
-                    response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
-                except Exception as e:
-                    st.write(f"  - flashモデル失敗: {e}, latestモデルで再試行...")
-                    model = genai.GenerativeModel('gemini-flash-latest')
-                    response = model.generate_content([prompt_text, text_buffer], generation_config={"response_mime_type": "application/json"})
+            ai_data_list = json.loads(response.text)
+            
+            for item in ai_data_list:
+                item['ファイル名'] = filename
+                if "⑩全処理委託量_ton" not in item: item["⑩全処理委託量_ton"] = 0
+            
+            return ai_data_list
 
-                ai_data_list = json.loads(response.text)
-                st.success(f"✅ AI救済成功: {len(ai_data_list)} 行抽出")
-                
-                for item in ai_data_list:
-                    item['ファイル名'] = filename
-                    # 必須項目の補完
-                    if "⑩全処理委託量_ton" not in item: item["⑩全処理委託量_ton"] = 0
-                
-                return ai_data_list
-
-            except Exception as e:
-                st.error(f"❌ AI解析も失敗しました: {e}")
-                return []
-
-        # ------------------------------------------------
-        # 2. PDFの場合
-        # ------------------------------------------------
-        elif file_ext == ".pdf":
-            st.write("🔹 PDF解析(AI)を実行中...")
-            try:
-                try:
-                    model = genai.GenerativeModel('gemini-2.5-flash')
-                except:
-                    model = genai.GenerativeModel('gemini-flash-latest')
-
-                sample_file = genai.upload_file(path=file_path, display_name=filename)
-                
-                # ファイル処理待ちループ
-                timeout_counter = 0
-                while sample_file.state.name == "PROCESSING":
-                    time.sleep(1)
-                    timeout_counter += 1
-                    sample_file = genai.get_file(sample_file.name)
-                    
-                    # 【重要修正】画像PDF対策：待ち時間を30秒→600秒に延長
-                    if timeout_counter > 600: 
-                        st.error("❌ PDF処理タイムアウト (10分経過)")
-                        return []
-                
-                if sample_file.state.name == "FAILED": 
-                    st.error("❌ Google側でPDF処理失敗")
-                    return []
-                
-                prompt_text = """
-                あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
-                必ず「①現状（実績）」の数値のみを抽出し、「②計画」は無視してください。
-                
-                【出力項目】
-                提出日, 対象年度, 文書種類(報告書), 排出事業者名, 事業の種類, 事業場名, 住所, 
-                廃棄物の種類, ⑩全処理委託量_ton, ⑪優良認定(t), ⑫再生利用(t), ⑬熱回収認定(t), ⑭熱回収その他(t), 自治体名
-
-                【出力フォーマット】
-                JSON形式のリストのみ。
-                """
-
-                # リトライ機構付き呼び出し
-                try:
-                    response = model.generate_content([sample_file, prompt_text], generation_config={"response_mime_type": "application/json"})
-                except:
-                    time.sleep(2)
-                    response = model.generate_content([sample_file, prompt_text], generation_config={"response_mime_type": "application/json"})
-                
-                data_list = json.loads(response.text)
-                st.success(f"✅ PDF解析成功: {len(data_list)} 行抽出")
-                
-                for item in data_list:
-                    item['ファイル名'] = filename
-                return data_list
-
-            except Exception as e:
-                st.error(f"❌ PDF解析エラー: {e}")
-                return []
-        
-        else:
-            st.write(f"⚠️ 未対応の拡張子: {file_ext}")
+        except Exception:
             return []
+
+    # ------------------------------------------------
+    # 2. PDFの場合 (.pdf)
+    # ------------------------------------------------
+    elif file_ext == ".pdf":
+        try:
+            try:
+                model = genai.GenerativeModel('gemini-2.5-flash')
+            except:
+                model = genai.GenerativeModel('gemini-flash-latest')
+
+            sample_file = genai.upload_file(path=file_path, display_name=filename)
+            
+            # 【重要】画像PDF対策：待ち時間を600秒(10分)に設定
+            timeout_counter = 0
+            while sample_file.state.name == "PROCESSING":
+                time.sleep(1)
+                timeout_counter += 1
+                sample_file = genai.get_file(sample_file.name)
+                
+                if timeout_counter > 600: 
+                    return [] # タイムアウト
+            
+            if sample_file.state.name == "FAILED": 
+                return []
+            
+            prompt_text = """
+            あなたはデータ入力の専門家です。資料から産業廃棄物処理の実績データを抽出してください。
+            必ず「①現状（実績）」の数値のみを抽出し、「②計画」は無視してください。
+            
+            【出力項目】
+            提出日, 対象年度, 文書種類(報告書), 排出事業者名, 事業の種類, 事業場名, 住所, 
+            廃棄物の種類, ⑩全処理委託量_ton, ⑪優良認定(t), ⑫再生利用(t), ⑬熱回収認定(t), ⑭熱回収その他(t), 自治体名
+
+            【出力フォーマット】
+            JSON形式のリストのみ。
+            """
+
+            try:
+                response = model.generate_content([sample_file, prompt_text], generation_config={"response_mime_type": "application/json"})
+            except:
+                time.sleep(2)
+                response = model.generate_content([sample_file, prompt_text], generation_config={"response_mime_type": "application/json"})
+            
+            data_list = json.loads(response.text)
+            
+            for item in data_list:
+                item['ファイル名'] = filename
+            return data_list
+
+        except Exception:
+            return []
+    
+    else:
+        return []
 
 def convert_df_to_excel(df):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
@@ -298,7 +274,7 @@ with tab1:
                     os.makedirs(save_dir, exist_ok=True)
                     
                     batch_data = []
-                    status_text.text("AIとPythonによる分析を開始します...")
+                    status_text.text("AIによる分析を開始します...")
                     
                     for i, uploaded_file in enumerate(uploaded_files):
                         file_path = os.path.join(save_dir, uploaded_file.name)
